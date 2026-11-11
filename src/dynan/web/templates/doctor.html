@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Environment - {{ product }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Environment</h1>
+  {% if report %}
+    {% if report.ok %}<span class="badge ok">ready</span>
+    {% else %}<span class="badge bad">{{ report.blocking | length }} blocking problem(s)</span>{% endif %}
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">Scope</div>
+  <div class="panel-body">
+    <form method="get" action="/doctor">
+      <div class="field">
+        <label for="config_path">Configuration (optional)</label>
+        <input type="text" id="config_path" name="config_path" value="{{ config_path }}"
+               list="config-options" placeholder="leave empty for general checks only" spellcheck="false">
+        <datalist id="config-options">
+          {% for c in configs %}<option value="{{ c }}">{% endfor %}
+        </datalist>
+        <div class="hint">
+          With a configuration, dynAn also checks sources, commits, build tools,
+          test manifests, the artifacts directory and any enabled extensions.
+        </div>
+      </div>
+      <button class="btn primary" type="submit">Run checks</button>
+    </form>
+  </div>
+</div>
+
+{% if error %}
+  <div class="notice bad"><strong>Configuration could not be loaded</strong><pre class="code">{{ error }}</pre></div>
+{% endif %}
+
+{% if report %}
+  {% if report.blocking %}
+  <div class="notice bad">
+    <strong>These must be resolved before a validation can run</strong>
+    <ul>
+      {% for d in report.blocking %}
+        <li><strong>{{ d.name }}</strong> &mdash; {{ d.detail }}
+          {% if d.remediation %}<br><span class="faint">Suggested: <code>{{ d.remediation }}</code></span>{% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% set grouped = {} %}
+  {% for d in report.diagnostics %}
+    {% if grouped.update({d.category: grouped.get(d.category, []) + [d]}) %}{% endif %}
+  {% endfor %}
+
+  {% for category, items in grouped | dictsort %}
+  <h2>{{ category }}</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Status</th><th>Component</th><th>Detail</th><th>Version</th><th>Remediation</th></tr></thead>
+      <tbody>
+      {% for d in items %}
+        <tr>
+          <td>
+            {% if d.status.value == 'ready' %}<span class="badge ok">ready</span>
+            {% elif d.status.value == 'missing' %}<span class="badge bad">missing</span>
+            {% elif d.status.value == 'misconfigured' %}<span class="badge warn">check</span>
+            {% elif d.status.value == 'unsupported' %}<span class="badge bad">unsupported</span>
+            {% else %}<span class="badge muted">n/a</span>{% endif %}
+          </td>
+          <td>{{ d.name }}{% if not d.required %} <span class="faint">(optional)</span>{% endif %}</td>
+          <td class="faint">{{ d.detail }}</td>
+          <td class="mono faint">{{ d.version or '' }}</td>
+          <td class="mono faint">{{ d.remediation if d.status.value != 'ready' else '' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endfor %}
+
+  <p class="faint" style="margin-top:24px">
+    dynAn never installs packages. Remediation commands are suggestions to run yourself.
+  </p>
+{% endif %}
+{% endblock %}

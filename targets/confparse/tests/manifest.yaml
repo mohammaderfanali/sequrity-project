@@ -1,0 +1,173 @@
+version: 1
+
+# Every expectation below is derived from SPEC.md, which was written before
+# the patches existed. No expectation was read off a program's output: the
+# project specification requires the correctness oracle to be independent of
+# the patched version.
+oracle:
+  provenance: "targets/confparse/SPEC.md"
+
+defaults:
+  delivery: stdin
+  timeout_s: 10
+
+tests:
+  # ---------------------------------------------------------------- valid
+  - id: valid_basic
+    category: valid
+    description: "Both separators in one input; SPEC section 7, first example."
+    input_file: inputs/valid_basic.txt
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        host=localhost
+        port=8080
+        ok 2
+      provenance: "SPEC.md section 4 and section 7"
+
+  - id: valid_colon_form
+    category: valid
+    description: "':' is equivalent to '=' and is normalised to '=' on output."
+    input_file: inputs/valid_colon_form.txt
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        alpha=one
+        beta=two
+        ok 2
+      provenance: "SPEC.md section 2 and section 4"
+
+  - id: valid_comments_and_blanks
+    category: valid
+    description: "Comments and blank lines are ignored and not counted."
+    input_file: inputs/valid_comments.txt
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        host=x
+        port=1
+        ok 2
+      provenance: "SPEC.md section 2"
+
+  - id: valid_empty_value
+    category: valid
+    description: "An empty value is explicitly permitted."
+    input_file: inputs/valid_empty_value.txt
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        flag=
+        ok 1
+      provenance: "SPEC.md section 3, rule 4"
+
+  - id: valid_twelve_char_value
+    category: valid
+    description: >
+      A 12-character value is well within the 15-character limit. This test
+      exists to catch a patch that fixes the overflow by tightening the limit
+      below what the specification allows.
+    input_file: inputs/valid_long_value.txt
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        token=abcdefghijkl
+        ok 1
+      provenance: "SPEC.md section 3, rule 3"
+
+  # ------------------------------------------------------------- boundary
+  - id: boundary_value_15
+    category: boundary
+    description: "Value of exactly 15 characters: the largest accepted value."
+    input_file: inputs/boundary_value_15.txt
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        v=123456789012345
+        ok 1
+      provenance: "SPEC.md section 3, rule 3"
+
+  - id: boundary_value_16
+    category: boundary
+    description: "Value of exactly 16 characters: the smallest rejected value."
+    input_file: inputs/boundary_value_16.txt
+    expect:
+      exit_code: 2
+      stdout_exact: ""
+      stderr_contains: ["error: line 1: value too long"]
+      provenance: "SPEC.md sections 3, 5 and 6"
+
+  - id: boundary_key_31
+    category: boundary
+    description: "Key of exactly 31 characters: the longest accepted key."
+    input_file: inputs/boundary_key_31.txt
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        k123456789012345678901234567890=v
+        ok 1
+      provenance: "SPEC.md section 3, rule 1"
+
+  - id: boundary_key_32
+    category: boundary
+    description: "Key of exactly 32 characters: the shortest rejected key."
+    input_file: inputs/boundary_key_32.txt
+    expect:
+      exit_code: 2
+      stderr_contains: ["error: line 1: key too long"]
+      provenance: "SPEC.md sections 3, 5 and 6"
+
+  # -------------------------------------------------------------- invalid
+  - id: invalid_no_separator
+    category: invalid
+    description: "A line with neither '=' nor ':'."
+    input_file: inputs/invalid_no_separator.txt
+    expect:
+      exit_code: 2
+      stderr_contains: ["error: line 1: missing separator"]
+      provenance: "SPEC.md section 3 rule 5, section 5"
+
+  - id: invalid_empty_key
+    category: invalid
+    description: "Separator present but the key is empty."
+    input_file: inputs/invalid_empty_key.txt
+    expect:
+      exit_code: 2
+      stderr_contains: ["error: line 1: empty key"]
+      provenance: "SPEC.md section 3 rule 1, section 5"
+
+  - id: invalid_key_characters
+    category: invalid
+    description: "Key containing a character outside [A-Za-z0-9_]."
+    input_file: inputs/invalid_key_chars.txt
+    expect:
+      exit_code: 2
+      stderr_contains: ["error: line 1: invalid key"]
+      provenance: "SPEC.md section 3 rule 2, section 5"
+
+  # ------------------------------------------------------------- security
+  # These inputs exceed the specified value length by a wide margin. A
+  # conforming implementation rejects them cleanly; the vulnerable base
+  # version overflows a fixed-size stack buffer instead.
+  - id: security_oversized_value_equals
+    category: security
+    description: "64-character value reaching the copy sink through the '=' path."
+    input_file: inputs/security_long_equals.txt
+    expect_baseline_signature: "stack buffer overflow in store_value"
+    expect:
+      exit_code: 2
+      stderr_contains: ["error: line 1: value too long"]
+      must_not_crash: true
+      provenance: "SPEC.md section 3 rule 3, section 5, section 6"
+
+  - id: security_oversized_value_colon
+    category: security
+    description: >
+      The same oversized value reaching the same sink through the ':' path.
+      A patch that guards only the '=' path leaves this one reachable.
+    input_file: inputs/security_long_colon.txt
+    expect_baseline_signature: "stack buffer overflow in store_value"
+    expect:
+      exit_code: 2
+      stderr_contains: ["error: line 1: value too long"]
+      must_not_crash: true
+      provenance: "SPEC.md section 3 rule 3, section 5, section 6"

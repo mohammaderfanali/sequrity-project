@@ -1,0 +1,155 @@
+# dynAn in CI.
+#
+# Two jobs with different purposes:
+#
+#   test     - dynAn's own test suite, proving the tool still behaves.
+#   validate - dynAn applied to target patches, proving the patches behave.
+#
+# The validate job propagates dynAn's exit code, so the pipeline's result is
+# the validation verdict. Reports are uploaded even when validation fails -
+# a failing run is exactly when the evidence matters most.
+
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: dynAn test suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bubblewrap
+
+      - name: Install dynAn
+        run: pip install -e '.[web,dev]'
+
+      - name: Environment readiness
+        run: dynan doctor
+
+      - name: Unit tests
+        run: pytest -m "not slow" -q
+
+      - name: Integration tests
+        run: pytest -m slow -q
+
+  validate:
+    name: validate ${{ matrix.variant }} patch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: correct
+            expected_exit: 0
+          - variant: incomplete
+            expected_exit: 10
+          - variant: regression
+            expected_exit: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bubblewrap
+
+      - name: Install dynAn
+        run: pip install -e .
+
+      # Fails fast with exit 30 if anything the configuration needs is absent,
+      # instead of surfacing as a confusing build error later.
+      - name: Preflight
+        run: dynan doctor --config configs/confparse-${{ matrix.variant }}.yaml
+
+      # dynAn exits non-zero for every non-PASS verdict, which is the point;
+      # the exit status is captured rather than allowed to end the job here,
+      # so evidence can be uploaded first.
+      - name: Validate patch
+        id: validate
+        run: |
+          set +e
+          dynan validate \
+            --config configs/confparse-${{ matrix.variant }}.yaml \
+            --quiet \
+            --json-out report-${{ matrix.variant }}.json
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      # Evidence is preserved regardless of outcome.
+      - name: Upload report and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynan-${{ matrix.variant }}
+          path: |
+            report-${{ matrix.variant }}.json
+            .dynan/runs/
+          retention-days: 14
+          if-no-files-found: warn
+
+      # This repository's fixtures have known expected verdicts, so CI asserts
+      # them. For a real project you would instead let the validate step's
+      # exit code fail the job directly.
+      - name: Check the verdict matches the scenario
+        run: |
+          actual="${{ steps.validate.outputs.exit_code }}"
+          expected="${{ matrix.expected_exit }}"
+          echo "expected=$expected actual=$actual"
+          # The process exit code and the recorded decision must agree.
+          recorded=$(python -c "import json;print(json.load(open('report-${{ matrix.variant }}.json'))['decision']['exit_code'])")
+          if [ "$actual" != "$recorded" ]; then
+            echo "::error::process exited $actual but the report records $recorded"
+            exit 1
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::expected exit $expected, got $actual"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          path = pathlib.Path("report-${{ matrix.variant }}.json")
+          if not path.is_file():
+              print("No report produced."); raise SystemExit
+          run = json.loads(path.read_text())
+          d = run["decision"]
+          print(f"### confparse / ${{ matrix.variant }}\n")
+          print(f"**{d['exit_code']}** — security `{d['security_status']}`, "
+                f"functional `{d['functional_status']}`, "
+                f"analysis `{d['analysis_completeness']}`\n")
+          if run.get("comparisons"):
+              print("| Status | Error | Location | Profile |")
+              print("|---|---|---|---|")
+              for c in run["comparisons"]:
+                  s = c["signature"]
+                  loc = s.get("function") or "not resolved"
+                  print(f"| {c['status']} | {s['error_type']} | `{loc}` | {c['profile']} |")
+          PY

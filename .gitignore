@@ -1,0 +1,9 @@
+.venv/
+.dynan/
+regression-suite/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+targets/*/build/

@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}New validation - {{ product }}{% endblock %}
+
+{% block content %}
+<div class="page-head"><h1>New validation</h1></div>
+
+<div class="notice info">
+  The form below selects a configuration file. dynAn uses one schema for the
+  CLI and this interface, so a configuration started here behaves identically
+  to <code>dynan validate --config &lt;file&gt;</code>. Source mode, build
+  profiles, test manifests and sandbox settings all come from that file.
+</div>
+
+<div class="panel">
+  <div class="panel-head">Configuration</div>
+  <div class="panel-body">
+    <div class="field">
+      <label for="config-select">Discovered configurations</label>
+      <select id="config-select">
+        <option value="">-- choose a file --</option>
+        {% for c in configs %}
+          <option value="{{ c }}" {{ 'selected' if c == default_config }}>{{ c }}</option>
+        {% endfor %}
+      </select>
+      <div class="hint">Found in the working directory and <code>configs/</code>.</div>
+    </div>
+
+    <div class="field">
+      <label for="config-path">Configuration path</label>
+      <input type="text" id="config-path" value="{{ default_config }}"
+             placeholder="/path/to/target.yaml" spellcheck="false">
+    </div>
+
+    <div class="row">
+      <button class="btn" id="btn-check">Validate configuration</button>
+      <button class="btn" id="btn-doctor">Run environment checks</button>
+      <div class="spacer"></div>
+      <button class="btn primary" id="btn-start">Start validation</button>
+    </div>
+    <div id="result" style="margin-top:16px"></div>
+  </div>
+</div>
+
+<div class="panel" id="progress-panel" hidden>
+  <div class="panel-head">Progress <span class="faint mono" id="progress-run"></span></div>
+  <div class="panel-body">
+    <div class="feed" id="feed"></div>
+    <div class="row" style="margin-top:12px">
+      <span class="faint" id="progress-status">starting...</span>
+      <div class="spacer"></div>
+      <a id="open-run" href="#" hidden>Open run &rarr;</a>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const select = document.getElementById('config-select');
+  const pathInput = document.getElementById('config-path');
+  const result = document.getElementById('result');
+
+  select.addEventListener('change', () => {
+    if (select.value) pathInput.value = select.value;
+  });
+
+  function notice(kind, html) {
+    result.innerHTML = `<div class="notice ${kind}">${html}</div>`;
+  }
+
+  async function post(url, body) {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, data };
+  }
+
+  document.getElementById('btn-check').addEventListener('click', async () => {
+    const path = pathInput.value.trim();
+    if (!path) return notice('warn', 'Enter a configuration path first.');
+    notice('info', 'Checking...');
+    const { ok, data } = await post('/api/v1/config/validate', { config_path: path });
+    if (!ok) {
+      const detail = data.detail || {};
+      const problems = (detail.problems || []).map(p => `<li>${escapeHtml(p)}</li>`).join('');
+      return notice('bad',
+        `<strong>${escapeHtml(detail.message || data.detail || 'Invalid configuration')}</strong>` +
+        (problems ? `<ul>${problems}</ul>` : ''));
+    }
+    notice('info',
+      `<strong>Configuration is valid</strong>` +
+      `<ul><li>target: <code>${escapeHtml(data.target)}</code></li>` +
+      `<li>source mode: <code>${escapeHtml(data.source_mode)}</code></li>` +
+      `<li>sandbox: <code>${escapeHtml(data.sandbox)}</code></li>` +
+      `<li>manifests: ${data.manifests.map(m => `<code>${escapeHtml(m)}</code>`).join(', ')}</li></ul>`);
+  });
+
+  document.getElementById('btn-doctor').addEventListener('click', () => {
+    const path = pathInput.value.trim();
+    window.location.href = '/doctor' + (path ? `?config_path=${encodeURIComponent(path)}` : '');
+  });
+
+  document.getElementById('btn-start').addEventListener('click', async (event) => {
+    const path = pathInput.value.trim();
+    if (!path) return notice('warn', 'Enter a configuration path first.');
+    const button = event.currentTarget;
+    button.disabled = true;
+    notice('info', 'Starting...');
+
+    const { ok, data } = await post('/api/v1/runs', { config_path: path });
+    if (!ok) {
+      button.disabled = false;
+      const detail = data.detail;
+      const message = typeof detail === 'string' ? detail : (detail && detail.message) || 'could not start';
+      const problems = (detail && detail.problems || []).map(p => `<li>${escapeHtml(p)}</li>`).join('');
+      return notice('bad', `<strong>${escapeHtml(message)}</strong>${problems ? `<ul>${problems}</ul>` : ''}`);
+    }
+
+    result.innerHTML = '';
+    dynan.followRun(data.run_id, {
+      panel: document.getElementById('progress-panel'),
+      label: document.getElementById('progress-run'),
+      feed: document.getElementById('feed'),
+      status: document.getElementById('progress-status'),
+      link: document.getElementById('open-run'),
+      onEnd: () => { button.disabled = false; },
+    });
+  });
+
+  function escapeHtml(value) {
+    const div = document.createElement('div');
+    div.textContent = String(value);
+    return div.innerHTML;
+  }
+})();
+</script>
+{% endblock %}

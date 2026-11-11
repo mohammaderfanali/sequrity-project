@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Runs - {{ product }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Validation runs</h1>
+  <span class="faint mono">{{ artifacts_root }}</span>
+</div>
+
+{% if not runs %}
+  <div class="empty">
+    <strong>No runs recorded yet</strong>
+    Start one from <a href="/new">New validation</a>, or run
+    <code>dynan validate --config &lt;file&gt;</code> in a terminal.
+    Runs created either way appear here.
+  </div>
+{% else %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Run</th><th>Target</th><th>Started</th><th class="num">Duration</th>
+          <th>Verdict</th><th>Security</th><th>Functional</th><th>Analysis</th>
+          <th>Base</th><th>Patched</th><th class="num">Findings</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for run in runs %}
+        <tr>
+          <td class="nowrap"><a class="mono" href="/runs/{{ run.run_id }}">{{ run.run_id }}</a></td>
+          <td>{{ run.target_name }}</td>
+          <td class="nowrap faint">{{ run.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td class="num faint">{{ run.duration_s | duration }}</td>
+          <td>
+            {% if run.run_id in active %}
+              <span class="badge info">running</span>
+            {# PASS is exit code 0, which is falsy - test for None explicitly
+               or every successful run renders as "no verdict". #}
+            {% elif run.exit_code is not none %}
+              <span class="badge {{ run.exit_code | verdict_class }}">
+                {{ run.exit_code.name }} ({{ run.exit_code.value }})
+              </span>
+            {% else %}
+              <span class="badge muted">-</span>
+            {% endif %}
+          </td>
+          <td class="faint">{{ run.security_status.value if run.security_status else '-' }}</td>
+          <td class="faint">{{ run.functional_status.value if run.functional_status else '-' }}</td>
+          <td class="faint">{{ run.analysis_completeness.value if run.analysis_completeness else '-' }}</td>
+          <td class="mono faint nowrap">{{ run.base_revision }}</td>
+          <td class="mono faint nowrap">{{ run.patched_revision }}</td>
+          <td class="num">{{ run.findings_count }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+{% endblock %}

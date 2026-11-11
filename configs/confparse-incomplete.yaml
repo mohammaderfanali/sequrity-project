@@ -1,0 +1,53 @@
+# dynAn configuration - confparse / incomplete patch
+#
+# Expected verdict: exit 10 (VULN_REMAINS)
+#
+# All paths are relative to this file.
+version: 1
+
+target:
+  name: confparse-incomplete
+  description: "Only the '=' parse path is guarded; ':' still reaches the sink."
+  language: c
+
+source:
+  mode: directories
+  base_path: ../targets/confparse/base
+  patched_path: ../targets/confparse/incomplete
+
+build:
+  working_dir: "."
+  binary: build/confparse
+  commands:
+    - ["make", "clean"]
+    - ["make"]
+  env:
+    CC: gcc
+  timeout_s: 300
+  # Release and sanitized profiles are supplied by dynAn's defaults; the
+  # target's Makefile reads CFLAGS/LDFLAGS from the environment, so no
+  # target-side change is needed to support either profile.
+
+execution:
+  argv: ["{binary}"]
+  delivery: stdin
+  timeout_s: 10
+  limits:
+    memory_mb: 1024
+    cpu_s: 10
+
+tests:
+  manifests:
+    - ../targets/confparse/tests/manifest.yaml
+  regression_suite: ../regression-suite/confparse-incomplete
+
+sandbox:
+  backend: bwrap
+
+analysis:
+  replay_count: 3
+  minimize: true
+  generate_regression_tests: true
+
+artifacts:
+  root: ../.dynan

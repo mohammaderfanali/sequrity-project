@@ -1,0 +1,425 @@
+{% extends "base.html" %}
+{% block title %}{{ run.target_name }} - {{ run.run_id }}{% endblock %}
+
+{% macro frames(finding) %}
+  {% if finding.frames %}
+  <details class="frames">
+    <summary>{{ finding.frames | length }} stack frame(s)</summary>
+    <ol start="0">
+      {% for f in finding.frames %}
+        <li class="{{ 'foreign' if not f.file or f.file.startswith('..') or '/usr/' in f.file }}">
+          {{ f.function or '&lt;unknown&gt;' }}
+          {%- if f.file %} <span class="faint">{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %}</span>{% endif %}
+        </li>
+      {% endfor %}
+    </ol>
+  </details>
+  {% endif %}
+{% endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ run.target_name }}</h1>
+  <span class="mono faint">{{ run.run_id }}</span>
+  <div class="spacer"></div>
+  <span class="faint">{{ run.created_at.strftime('%Y-%m-%d %H:%M') }} &middot; {{ run.duration_s | duration }}</span>
+</div>
+
+{% if run.decision %}
+<div class="verdict {{ run.decision.exit_code | verdict_class }}">
+  <div>
+    <div class="verdict-code">{{ run.decision.exit_code.name }}</div>
+    <div class="faint mono">exit {{ run.decision.exit_code.value }}</div>
+  </div>
+  <div class="metrics">
+    <div class="metric"><span class="label">Security</span><span class="value">{{ run.decision.security_status.value }}</span></div>
+    <div class="metric"><span class="label">Functionality</span><span class="value">{{ run.decision.functional_status.value }}</span></div>
+    <div class="metric"><span class="label">Analysis</span><span class="value">{{ run.decision.analysis_completeness.value }}</span></div>
+    <div class="metric"><span class="label">Oracle checks</span><span class="value">{{ passed }}/{{ run.oracle_checks | length }}</span></div>
+    <div class="metric"><span class="label">Findings</span><span class="value">{{ run.findings | length }}</span></div>
+  </div>
+</div>
+{% endif %}
+
+{% if run.errors %}
+<div class="notice bad"><strong>Errors</strong><ul>{% for e in run.errors %}<li>{{ e }}</li>{% endfor %}</ul></div>
+{% endif %}
+{% if run.warnings %}
+<div class="notice warn"><strong>Warnings</strong><ul>{% for w in run.warnings %}<li>{{ w }}</li>{% endfor %}</ul></div>
+{% endif %}
+
+<div class="tabs" role="tablist">
+  <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+  <button role="tab" data-tab="tests">Tests<span class="count">{{ run.oracle_checks | length }}</span></button>
+  <button role="tab" data-tab="findings">Findings<span class="count">{{ run.comparisons | length }}</span></button>
+  <button role="tab" data-tab="diff">Diff<span class="count">{{ run.diff.files_changed if run.diff else 0 }}</span></button>
+  <button role="tab" data-tab="evidence">Evidence</button>
+</div>
+
+<!-- ------------------------------------------------------------ overview -->
+<section class="tabpanel" data-panel="overview">
+  <h2>Decision rationale</h2>
+  {% if run.decision and run.decision.reasons %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>Explanation</th></tr></thead>
+      <tbody>
+      {% for r in run.decision.reasons %}
+        <tr><td class="mono nowrap faint">{{ r.code }}</td><td>{{ r.message }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <h2>Sources</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Version</th><th>Revision</th><th>Exact VCS</th><th>Origin</th></tr></thead>
+      <tbody>
+      {% for rev in [run.sources.base, run.sources.patched] if run.sources %}
+        <tr>
+          <td>{{ rev.version.value }}</td>
+          <td class="mono">{{ rev.display_revision }}</td>
+          <td>{% if rev.is_exact_vcs_revision %}<span class="badge ok">yes</span>
+              {% else %}<span class="badge warn">content hash</span>{% endif %}</td>
+          <td class="mono faint">{{ rev.origin }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Builds</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Version</th><th>Profile</th><th>Status</th><th>Binary sha256</th><th>Toolchain</th></tr></thead>
+      <tbody>
+      {% for b in run.builds %}
+        <tr>
+          <td>{{ b.version.value }}</td>
+          <td>{{ b.profile.value }}</td>
+          <td>{% if b.success %}<span class="badge ok">built</span>{% else %}<span class="badge bad">failed</span>{% endif %}</td>
+          <td class="mono faint">{{ (b.binary_sha256 or b.error or '')[:40] }}</td>
+          <td class="faint">{{ b.toolchain or '' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Binary hardening</h2>
+  {% if run.hardening and run.hardening.base and run.hardening.patched %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Protection</th><th>Base</th><th>Patched</th><th>Change</th><th>Evidence (base)</th></tr></thead>
+      <tbody>
+      {% for c in run.hardening.changes %}
+        <tr>
+          <td>{{ c.property_name }}</td>
+          <td>{{ c.base_state.value }}</td>
+          <td>{{ c.patched_state.value }}</td>
+          <td>
+            {% if c.delta.value == 'weakened' %}<span class="badge bad">weakened</span>
+            {% elif c.delta.value == 'strengthened' %}<span class="badge ok">strengthened</span>
+            {% else %}<span class="badge muted">{{ c.delta.value }}</span>{% endif %}
+          </td>
+          <td class="mono faint">{{ c.detail[:70] }}</td>
+        </tr>
+      {% endfor %}
+        <tr>
+          <td>RELRO level</td>
+          <td>{{ run.hardening.base.relro_level.value }}</td>
+          <td>{{ run.hardening.patched.relro_level.value }}</td>
+          <td><span class="badge muted">reported</span></td>
+          <td class="faint">partial/full distinction</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="notice info" style="margin-top:12px">
+    <strong>Caveats</strong>
+    <ul>{% for c in run.hardening.base.caveats %}<li>{{ c }}</li>{% endfor %}</ul>
+  </div>
+  {% else %}
+    <div class="empty">Hardening inspection did not complete for this run.</div>
+  {% endif %}
+
+  <h2>Stages</h2>
+  <div class="stage-list">
+    {% for s in run.stages %}
+    <div class="stage-row">
+      <span class="name">{{ s.stage.value }}</span>
+      <span class="badge {{ 'ok' if s.state.value == 'completed' else ('bad' if s.state.value == 'failed' else 'muted') }}">{{ s.state.value }}</span>
+      <span class="faint mono">{{ s.duration_s | duration }}</span>
+      <span class="detail">{{ s.message }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<!-- --------------------------------------------------------------- tests -->
+<section class="tabpanel" data-panel="tests" hidden>
+  <h2>Oracle checks <span class="faint">{{ passed }}/{{ run.oracle_checks | length }} passed</span></h2>
+  {% if failures %}
+  <h3>Failing</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Test</th><th>Version</th><th>Profile</th><th>Outcome</th><th>Expected</th><th>Violations</th></tr></thead>
+      <tbody>
+      {% for c in failures %}
+        <tr>
+          <td class="mono">{{ c.test_id }}</td>
+          <td>{{ c.version.value }}</td>
+          <td>{{ c.profile.value }}</td>
+          <td><span class="badge {{ c.outcome | outcome_class }}">{{ c.outcome.value }}</span></td>
+          <td class="faint">{{ c.expected_summary }}</td>
+          <td>{{ c.violations | join('; ') }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <h3>Test definitions</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Id</th><th>Category</th><th>Delivery</th><th>Oracle provenance</th><th>Description</th></tr></thead>
+      <tbody>
+      {% for t in run.tests %}
+        <tr>
+          <td class="mono">{{ t.test_id }}{% if t.generated %} <span class="badge info">generated</span>{% endif %}</td>
+          <td>{{ t.category.value }}</td>
+          <td class="faint">{{ t.delivery.value }}</td>
+          <td class="faint">{{ t.expectation.provenance }}</td>
+          <td class="faint">{{ t.description }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if run.regressions %}
+  <h2>Functional regressions</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Test</th><th>Profile</th><th>Base</th><th>Patched</th><th>Violation</th></tr></thead>
+      <tbody>
+      {% for r in run.regressions %}
+        <tr>
+          <td class="mono">{{ r.test_id }}</td>
+          <td>{{ r.profile.value }}</td>
+          <td><span class="badge ok">satisfied oracle</span></td>
+          <td><span class="badge bad">violated oracle</span></td>
+          <td>{{ r.violations | join('; ') }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+<!-- ------------------------------------------------------------ findings -->
+<section class="tabpanel" data-panel="findings" hidden>
+  {% if not run.comparisons %}
+    <div class="empty"><strong>No findings</strong>No failure was observed in either version within this test scope.</div>
+  {% else %}
+  <h2>Differential status</h2>
+  {% for c in run.comparisons %}
+    <div class="panel">
+      <div class="panel-head">
+        <span class="badge {{ 'bad' if c.status.value in ('incomplete_fix','new_issue') else ('ok' if c.status.value == 'fixed' else 'muted') }}">{{ c.status.value }}</span>
+        <span class="mono">{{ c.signature.error_type.value }}</span>
+        <span class="faint">via {{ c.signature.detection.value }} &middot; {{ c.profile.value }} build</span>
+      </div>
+      <div class="panel-body">
+        <div class="metrics" style="margin-bottom:12px">
+          <div class="metric"><span class="label">Location</span>
+            <span class="value mono">{% if c.signature.function %}{{ c.signature.function }}(){% else %}not resolved{% endif %}{% if c.signature.file %} &mdash; {{ c.signature.file }}{% if c.signature.line %}:{{ c.signature.line }}{% endif %}{% endif %}</span></div>
+          <div class="metric"><span class="label">Confidence</span><span class="value">{{ c.confidence.value }}</span></div>
+          <div class="metric"><span class="label">Tests</span><span class="value mono">{{ c.test_ids | join(', ') }}</span></div>
+        </div>
+        <p class="muted-text">{{ c.rationale }}</p>
+
+        {% if c.correlation %}
+        <h3>Relationship to the patch
+          <span class="badge {{ c.correlation.verdict | verdict_class }}">{{ c.correlation.verdict.value }}</span>
+          <span class="faint">({{ c.correlation.confidence.value }})</span>
+        </h3>
+        <p class="muted-text">{{ c.correlation.rationale }}</p>
+        <ul class="evidence">
+          {% for e in c.correlation.evidence %}
+          <li>{{ e.description }}
+            {% if e.file %}<span class="where">[{{ e.file }}{% if e.line %}:{{ e.line }}{% endif %}]</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+        {% if c.correlation.related_diff_locations %}
+          <p class="faint">Diff regions:
+            {% for loc in c.correlation.related_diff_locations %}
+              <a href="#" class="mono" data-goto-diff="{{ loc }}">{{ loc }}</a>{% if not loop.last %}, {% endif %}
+            {% endfor %}
+          </p>
+        {% endif %}
+        {% endif %}
+
+        {% for fid in c.patched_finding_ids + c.base_finding_ids %}
+          {% set f = run.finding(fid) %}
+          {% if f %}
+            <h3 class="faint">{{ f.version.value }} &middot; {{ f.test_id }}</h3>
+            <pre class="code">{{ f.message }}</pre>
+            {{ frames(f) }}
+            {% set repro = run.reproduction_for(fid) %}
+            {% set mini = run.minimization_for(fid) %}
+            <p class="faint">
+              {% if repro %}Replays: {{ repro.reproduced_count }}/{{ repro.total_attempts }}
+                {% if repro.stable %}<span class="badge ok">stable</span>{% else %}<span class="badge bad">unstable</span>{% endif %}
+                &middot; <a href="/api/v1/runs/{{ run.run_id }}/artifacts?path={{ repro.bundle_path }}/metadata.json">bundle</a>
+              {% endif %}
+              {% if mini %} &middot; minimised {{ mini.original_size }} &rarr; {{ mini.minimized_size }} bytes
+                {% if mini.verified %}<span class="badge ok">verified</span>{% else %}<span class="badge warn">unverified</span>{% endif %}
+              {% endif %}
+              {% if f.raw_report_artifact %} &middot; <a href="/api/v1/runs/{{ run.run_id }}/artifacts?path={{ f.raw_report_artifact }}">raw report</a>{% endif %}
+            </p>
+          {% endif %}
+        {% endfor %}
+      </div>
+    </div>
+  {% endfor %}
+  {% endif %}
+
+  {% if run.generated_tests %}
+  <h2>Generated regression tests</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Test id</th><th>Fails on base</th><th>Passes on patched</th><th>Notes</th></tr></thead>
+      <tbody>
+      {% for g in run.generated_tests %}
+        <tr>
+          <td class="mono">{{ g.test_id }}</td>
+          <td>{% if g.verified_fails_on_base %}<span class="badge ok">verified</span>{% elif g.verified_fails_on_base is none %}<span class="badge muted">not verified</span>{% else %}<span class="badge bad">no</span>{% endif %}</td>
+          <td>{% if g.verified_passes_on_patched %}<span class="badge ok">verified</span>{% elif g.verified_passes_on_patched is none %}<span class="badge muted">not verified</span>{% else %}<span class="badge bad">no</span>{% endif %}</td>
+          <td class="faint">{{ g.notes }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+<!-- ---------------------------------------------------------------- diff -->
+<section class="tabpanel" data-panel="diff" hidden>
+  {% if not run.diff or run.diff.is_empty %}
+    <div class="empty"><strong>No differences</strong>The two source versions are identical.</div>
+  {% else %}
+  <div class="row" style="margin-bottom:12px">
+    <span class="faint">{{ run.diff.files_changed }} file(s)</span>
+    <span class="badge ok">+{{ run.diff.total_added }}</span>
+    <span class="badge bad">-{{ run.diff.total_removed }}</span>
+    <div class="spacer"></div>
+    <a href="/api/v1/runs/{{ run.run_id }}/artifacts?path=diff.patch">raw patch</a>
+  </div>
+  {% if run.diff.consistency_warning %}
+    <div class="notice warn">{{ run.diff.consistency_warning }}</div>
+  {% endif %}
+
+  {% for fd in run.diff.files %}
+    {% set hunks = side_by_side(fd) %}
+    <div class="diff" id="diff-{{ fd.path | replace('/', '-') }}">
+      <div class="diff-file-head">
+        <strong>{{ fd.path }}</strong>
+        <span class="badge muted">{{ fd.change_kind }}</span>
+        <span class="badge ok">+{{ fd.added_lines }}</span>
+        <span class="badge bad">-{{ fd.removed_lines }}</span>
+        {% if fd.changed_functions %}
+          <span class="faint">functions: {{ fd.changed_functions | join(', ') }}</span>
+        {% endif %}
+      </div>
+      <div class="diff-body">
+        <table class="diff-table">
+          {% for h in hunks %}
+            <tr class="hunk"><td colspan="4">{{ h.header }}{% if h.section %}  {{ h.section }}{% endif %}</td></tr>
+            {% for r in h.rows %}
+            <tr class="{{ 'del' if r.left_class == 'del' and r.right_class != 'add' else ('add' if r.right_class == 'add' and r.left_class != 'del' else '') }}">
+              <td class="ln">{{ r.left_lineno or '' }}</td>
+              <td class="src {{ r.left_class }}" data-line="{{ fd.path }}:{{ r.left_lineno }}">{{ r.left_text if r.left_text is not none else '' }}</td>
+              <td class="ln">{{ r.right_lineno or '' }}</td>
+              <td class="src {{ r.right_class }}" data-line="{{ fd.path }}:{{ r.right_lineno }}">{{ r.right_text if r.right_text is not none else '' }}</td>
+            </tr>
+            {% endfor %}
+          {% endfor %}
+        </table>
+      </div>
+    </div>
+  {% endfor %}
+  {% endif %}
+</section>
+
+<!-- ------------------------------------------------------------ evidence -->
+<section class="tabpanel" data-panel="evidence" hidden>
+  <h2>Executions <span class="faint">{{ run.executions | length }}</span></h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Execution</th><th>Version</th><th>Profile</th><th>Exit</th><th>Signal</th><th>Outcome</th><th class="num">Duration</th><th>Artifacts</th></tr></thead>
+      <tbody>
+      {% for e in run.executions %}
+        <tr>
+          <td class="mono">{{ e.execution_id }}</td>
+          <td>{{ e.version.value }}</td>
+          <td>{{ e.profile.value }}</td>
+          <td class="num">{{ e.exit_code if e.exit_code is not none else '-' }}</td>
+          <td>{{ e.signal_name or '-' }}</td>
+          <td><span class="badge {{ 'muted' if e.outcome.value == 'completed' else 'warn' }}">{{ e.outcome.value }}</span></td>
+          <td class="num faint">{{ '%.3f' % e.duration_s }}s</td>
+          <td class="nowrap">
+            {% if e.stdout_artifact %}<a href="/api/v1/runs/{{ run.run_id }}/artifacts?path={{ e.stdout_artifact }}">out</a>{% endif %}
+            {% if e.stderr_artifact %} <a href="/api/v1/runs/{{ run.run_id }}/artifacts?path={{ e.stderr_artifact }}">err</a>{% endif %}
+            {% if e.input_artifact %} <a href="/api/v1/runs/{{ run.run_id }}/artifacts?path={{ e.input_artifact }}">in</a>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Reproducer bundles</h2>
+  {% if run.reproductions %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Finding</th><th>Replays</th><th>Revision</th><th>Binary sha256</th><th>Bundle</th></tr></thead>
+      <tbody>
+      {% for r in run.reproductions %}
+        <tr>
+          <td class="mono">{{ r.finding_id[:48] }}</td>
+          <td>{{ r.reproduced_count }}/{{ r.total_attempts }}
+              {% if r.stable %}<span class="badge ok">stable</span>{% else %}<span class="badge bad">unstable</span>{% endif %}</td>
+          <td class="mono faint">{{ r.revision[:40] }}</td>
+          <td class="mono faint">{{ (r.binary_sha256 or '')[:16] }}</td>
+          <td class="nowrap">
+            <a href="/api/v1/runs/{{ run.run_id }}/artifacts?path={{ r.bundle_path }}/metadata.json">metadata</a>
+            <a href="/api/v1/runs/{{ run.run_id }}/artifacts?path={{ r.bundle_path }}/reproduce.sh">reproduce.sh</a>
+            <a href="/api/v1/runs/{{ run.run_id }}/artifacts?path={{ r.bundle_path }}/input.bin">input</a>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <div class="empty">No reproducer bundles were produced for this run.</div>
+  {% endif %}
+
+  {% if run.extension_results %}
+  <h2>Optional extensions <span class="badge warn">advisory, unverified</span></h2>
+  <pre class="code">{{ run.extension_results | tojson(indent=2) }}</pre>
+  {% endif %}
+
+  <h2>Raw result</h2>
+  <p><a href="/api/v1/runs/{{ run.run_id }}">results.json</a> &middot;
+     <a href="/api/v1/runs/{{ run.run_id }}/findings">findings</a> &middot;
+     <a href="/api/v1/runs/{{ run.run_id }}/diff">diff</a></p>
+</section>
+{% endblock %}

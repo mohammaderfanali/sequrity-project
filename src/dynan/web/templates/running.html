@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Running - {{ product }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Validation in progress</h1>
+  <span class="mono faint">{{ run_id }}</span>
+</div>
+
+<div class="panel">
+  <div class="panel-head">Progress</div>
+  <div class="panel-body">
+    <div class="feed" id="feed"></div>
+    <div class="row" style="margin-top:12px">
+      <span class="faint" id="progress-status">connecting...</span>
+      <div class="spacer"></div>
+      <a id="open-run" href="/runs/{{ run_id }}" hidden>Open results &rarr;</a>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+dynan.followRun({{ run_id | tojson }}, {
+  feed: document.getElementById('feed'),
+  status: document.getElementById('progress-status'),
+  link: document.getElementById('open-run'),
+  onEnd: () => setTimeout(() => window.location.reload(), 800),
+});
+</script>
+{% endblock %}
