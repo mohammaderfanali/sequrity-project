@@ -26,7 +26,7 @@ from pathlib import Path
 
 from ..config.loader import ConfigError
 from ..config.schema import DynanConfig, ResourceLimits
-from ..config.testsuite import load_manifests, read_test_input
+from ..config.testsuite import load_manifests, read_test_input, validate_delivery
 from ..domain.enums import BuildProfile, DependencyStatus
 from ..domain.models import Diagnostic, DoctorReport
 from ..infra import git
@@ -546,6 +546,18 @@ def check_tests(config: DynanConfig) -> list[Diagnostic]:
             _broken("tests: definitions", str(exc), "fix the manifest", category="tests")
         )
         return diagnostics
+
+    try:
+        validate_delivery(specs, config.execution.argv)
+    except ConfigError as exc:
+        diagnostics.append(
+            _broken(
+                "tests: input delivery",
+                "; ".join(exc.problems) or exc.message,
+                "add {input} to execution.argv or to the test's own argv",
+                category="tests",
+            )
+        )
 
     missing_inputs = []
     for spec in specs:

@@ -144,6 +144,74 @@ tests:
       stderr_contains: ["error: line 1: invalid key"]
       provenance: "SPEC.md section 3 rule 2, section 5"
 
+  # ------------------------------------------- input / output mechanisms
+  # confparse accepts its input on stdin, from a named file, or inline via
+  # -c, and can write its result to a file with -o. The same behaviour must
+  # hold through every one of those paths (SPEC.md section 8), so each is
+  # exercised explicitly rather than assumed.
+
+  - id: delivery_file_input
+    category: valid
+    description: "Same input delivered as a named file argument instead of stdin."
+    delivery: file
+    argv: ["{input}"]
+    input_file: inputs/valid_basic.txt
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        host=localhost
+        port=8080
+        ok 2
+      provenance: "SPEC.md sections 4 and 8"
+
+  - id: delivery_argv_input
+    category: valid
+    description: "Same input passed inline on the command line via -c."
+    delivery: argv
+    argv: ["-c", "{input}"]
+    input: "host = localhost\nport:8080\n"
+    expect:
+      exit_code: 0
+      stdout_exact: |
+        host=localhost
+        port=8080
+        ok 2
+      provenance: "SPEC.md sections 4 and 8"
+
+  - id: output_file_written
+    category: valid
+    description: >
+      With -o the result goes to a file and stdout stays empty. This is the
+      correctness criterion for a program whose real output is a file.
+    argv: ["-o", "result.txt"]
+    input_file: inputs/valid_basic.txt
+    expect:
+      exit_code: 0
+      stdout_exact: ""
+      output_file:
+        path: result.txt
+        exact: |
+          host=localhost
+          port=8080
+          ok 2
+      provenance: "SPEC.md sections 4 and 8"
+
+  - id: output_file_empty_on_first_line_error
+    category: invalid
+    description: >
+      The output file is created before reading, so an error on line 1 leaves
+      it existing but empty. Asserting the exact (empty) content rules out a
+      partial write, which a "file exists" check would not.
+    argv: ["-o", "result.txt"]
+    input_file: inputs/invalid_no_separator.txt
+    expect:
+      exit_code: 2
+      stderr_contains: ["error: line 1: missing separator"]
+      output_file:
+        path: result.txt
+        exact: ""
+      provenance: "SPEC.md section 8, output destination"
+
   # ------------------------------------------------------------- security
   # These inputs exceed the specified value length by a wide margin. A
   # conforming implementation rejects them cleanly; the vulnerable base

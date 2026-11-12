@@ -70,7 +70,7 @@ def run_campaign(
 ) -> CampaignResult:
     """Fuzz one build until a budget is exhausted."""
     fuzz = config.extensions.fuzz
-    probe = corpus_mod.build_probe(version, config.execution.delivery)
+    probe = corpus_mod.build_probe(version, config.fuzz_delivery(), fuzz.argv)
     triager = Triager(
         config=fuzz,
         runner=runner,

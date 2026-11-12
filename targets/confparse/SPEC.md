@@ -86,6 +86,37 @@ It then stops processing and exits.
 No other exit code is specified. The program must not terminate abnormally
 (signal, abort) for any input, including malformed or oversized input.
 
+## 8. Command-line interface
+
+```
+confparse [INPUT_FILE] [-c TEXT] [-o OUTPUT_FILE]
+```
+
+| Form | Input source |
+| ---- | ------------ |
+| no `INPUT_FILE`, no `-c` | standard input |
+| `INPUT_FILE` | the named file |
+| `-c TEXT` | `TEXT` itself, treated as the file contents |
+
+Giving both `INPUT_FILE` and `-c` is an error.
+
+The rules in sections 2 to 6 apply identically whichever source is used. The
+input mechanism must not change the result.
+
+### Output destination
+
+Without `-o`, accepted entries and the final `ok N` line go to standard
+output. With `-o OUTPUT_FILE` they go to that file instead, and standard
+output stays empty. Error messages always go to standard error regardless.
+
+The output file is created as soon as the program starts, before any input is
+read. If an invalid line is found, the file therefore exists and holds the
+entries accepted *before* the error — for an error on the first line, that is
+an empty file.
+
+Failure to open the input or output file is an error: a message on standard
+error and exit code `2`.
+
 ## 7. Worked examples
 
 Input:

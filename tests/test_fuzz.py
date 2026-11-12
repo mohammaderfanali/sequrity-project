@@ -105,9 +105,64 @@ def test_generation_varies_within_one_sequence():
     assert len(samples) > 1
 
 
-def test_escaped_braces_are_literal():
-    grammar = make_grammar(start="a", rules={"a": ["{{literal}}"]})
-    assert grammar.generate(random.Random(1), max_bytes=64) == b"{literal}"
+# -- brace handling ---------------------------------------------------------
+#
+# These cases all passed silently before the tokeniser replaced a lookbehind
+# regex: a malformed reference became literal text, so a typo produced a
+# fuzzer that quietly explored nothing.
+
+
+def expand(rules: dict[str, list[str]], start: str = "a") -> bytes:
+    grammar = make_grammar(start=start, rules=rules)
+    return grammar.generate(random.Random(1), max_bytes=128)
+
+
+@pytest.mark.parametrize(
+    ("alternative", "expected"),
+    [
+        ("{{literal}}", b"{literal}"),
+        # Escaped brace immediately around a real reference. The old regex
+        # returned b"{{b}}" here - the reference was never expanded.
+        ("{{{b}}}", b"{X}"),
+        ("}}{{", b"}{"),
+        ("{{{{", b"{{"),
+        ("}}}}", b"}}"),
+        ("a{{b}}c", b"a{b}c"),
+    ],
+)
+def test_escaped_braces_expand_correctly(alternative, expected):
+    assert expand({"a": [alternative], "b": ["X"]}) == expected
+
+
+@pytest.mark.parametrize(
+    ("alternative", "message"),
+    [
+        ("{b", "unterminated"),
+        ("if (x) {", "unterminated"),
+        ("{ b }", "not a valid reference"),
+        ("{b-c}", "not a valid reference"),
+        ("{}", "not a valid reference"),
+        ("{9bad}", "not a valid reference"),
+        ("b}", "stray"),
+    ],
+)
+def test_malformed_braces_are_rejected(alternative, message):
+    """A typo must be an error, never silently-literal text."""
+    with pytest.raises(ValidationError, match=message):
+        GrammarConfig(start="a", rules={"a": [alternative], "b": ["X"]})
+
+
+def test_validation_and_expansion_agree_on_references():
+    """The cost analysis and the generator must tokenise identically.
+
+    If they disagreed, a rule could be judged terminating while expansion
+    recursed through a reference the analysis never saw.
+    """
+    from dynan.config.schema import grammar_expansion_costs
+
+    rules = {"a": ["{{x}}{b}"], "b": ["y"]}
+    assert grammar_expansion_costs(rules) == {"b": 0, "a": 1}
+    assert expand(rules) == b"{x}y"
 
 
 # --------------------------------------------------------------------------
@@ -331,3 +386,44 @@ def test_extension_results_cannot_change_the_verdict():
     after = evaluate(run)
     assert after.exit_code is ExitCode.PASS
     assert after.security_status == before.security_status
+
+
+# --------------------------------------------------------------------------
+# Duplicate YAML keys (affects every dynAn file, not just grammars)
+# --------------------------------------------------------------------------
+
+
+def test_duplicate_yaml_keys_are_rejected():
+    """PyYAML keeps the last duplicate silently; dynAn must not."""
+    from dynan.config.loader import safe_load_strict
+    import yaml as _yaml
+
+    text = "rules:\n  value: ['a']\n  value: ['b']\n"
+    assert _yaml.safe_load(text) == {"rules": {"value": ["b"]}}  # the trap
+    with pytest.raises(_yaml.YAMLError, match="duplicate key"):
+        safe_load_strict(text)
+
+
+def test_duplicate_key_in_a_config_file_is_an_error(tmp_path):
+    from dynan.config.loader import ConfigError, load_config
+
+    path = tmp_path / "c.yaml"
+    path.write_text("version: 1\nversion: 2\n")
+    with pytest.raises(ConfigError, match="duplicate key"):
+        load_config(path)
+
+
+def test_duplicate_test_id_in_a_manifest_is_an_error(tmp_path):
+    """A repeated test id would silently halve the suite."""
+    from dynan.config.loader import ConfigError
+    from dynan.config.testsuite import load_manifest
+
+    path = tmp_path / "m.yaml"
+    path.write_text(
+        "version: 1\n"
+        "tests:\n"
+        "  - id: t1\n    input: 'a'\n"
+        "  - id: t1\n    input: 'b'\n"
+    )
+    with pytest.raises(ConfigError, match="duplicate test id"):
+        load_manifest(path)

@@ -28,7 +28,7 @@ from pathlib import Path
 from .. import RESULT_SCHEMA_VERSION, __version__
 from ..config.loader import ConfigError
 from ..config.schema import DynanConfig
-from ..config.testsuite import load_manifests, read_test_input
+from ..config.testsuite import load_manifests, read_test_input, validate_delivery
 from ..domain import decision as decision_engine
 from ..domain.enums import (
     AnalysisCompleteness,
@@ -212,6 +212,11 @@ class ValidationPipeline:
 
         if not tests:
             raise PipelineAbort("the configured test manifests define no tests")
+
+        try:
+            validate_delivery(tests, self.config.execution.argv)
+        except ConfigError as exc:
+            raise PipelineAbort(str(exc)) from exc
 
         for spec in tests:
             try:

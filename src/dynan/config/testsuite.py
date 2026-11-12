@@ -16,14 +16,14 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 
 from ..domain.enums import InputDelivery, TestCategory
-from ..domain.models import OracleExpectation, TestCaseSpec
-from .loader import ConfigError
+from ..domain.models import OracleExpectation, OutputFileExpectation, TestCaseSpec
+from .loader import ConfigError, safe_load_strict
 
 MANIFEST_VERSION = 1
 
@@ -52,6 +52,8 @@ def _parse_expectation(
         "stdout_contains",
         "stdout_regex",
         "stderr_contains",
+        "output_file",
+        "output_files",
         "must_not_crash",
         "max_duration_s",
         "provenance",
@@ -79,10 +81,82 @@ def _parse_expectation(
         stdout_contains=list(contains),
         stdout_regex=regex,
         stderr_contains=list(stderr_contains),
+        output_files=_parse_output_files(raw, where),
         must_not_crash=bool(raw.get("must_not_crash", True)),
         max_duration_s=raw.get("max_duration_s"),
         provenance=raw.get("provenance") or default_provenance,
     )
+
+
+def _parse_output_files(
+    raw: dict[str, Any], where: str
+) -> list[OutputFileExpectation]:
+    """Parse ``output_file`` (one mapping) or ``output_files`` (a list)."""
+    entries: list[Any] = []
+    if "output_file" in raw:
+        entries.append(raw["output_file"])
+    if "output_files" in raw:
+        listed = raw["output_files"]
+        if not isinstance(listed, list):
+            raise ConfigError(f"{where}: 'output_files' must be a list")
+        entries.extend(listed)
+
+    parsed: list[OutputFileExpectation] = []
+    seen: set[str] = set()
+
+    for entry in entries:
+        # A bare string means "this file must exist".
+        if isinstance(entry, str):
+            entry = {"path": entry}
+        item = _require_mapping(entry, f"{where}: output file")
+
+        unknown = set(item) - {"path", "exists", "exact", "contains", "regex"}
+        if unknown:
+            raise ConfigError(
+                f"{where}: unknown output file keys: {', '.join(sorted(unknown))}"
+            )
+
+        path = str(item.get("path") or "").strip()
+        if not path:
+            raise ConfigError(f"{where}: output file entry needs a 'path'")
+        if PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
+            raise ConfigError(
+                f"{where}: output file path {path!r} must be relative to the "
+                "execution working directory and must not contain '..'"
+            )
+        if path in seen:
+            raise ConfigError(f"{where}: duplicate output file path {path!r}")
+        seen.add(path)
+
+        regex = item.get("regex")
+        if regex is not None:
+            try:
+                re.compile(regex)
+            except re.error as exc:
+                raise ConfigError(
+                    f"{where}: output file {path!r} regex is invalid: {exc}"
+                ) from exc
+
+        contains = item.get("contains") or []
+        if isinstance(contains, str):
+            contains = [contains]
+
+        exists = bool(item.get("exists", True))
+        expectation = OutputFileExpectation(
+            path=path,
+            exists=exists,
+            exact=item.get("exact"),
+            contains=list(contains),
+            regex=regex,
+        )
+        if not exists and expectation.has_content_assertion:
+            raise ConfigError(
+                f"{where}: output file {path!r} sets exists: false but also "
+                "asserts content; a file cannot be both absent and matching"
+            )
+        parsed.append(expectation)
+
+    return parsed
 
 
 def _resolve_input(
@@ -128,7 +202,10 @@ def load_manifest(path: str | Path) -> list[TestCaseSpec]:
         raise ConfigError(f"Test manifest not found: {manifest_path}")
 
     try:
-        raw = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        # Strict parsing: a duplicated key in a manifest would silently drop
+        # a test definition, which is exactly the kind of quiet coverage loss
+        # a validation tool must not have.
+        raw = safe_load_strict(manifest_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
         raise ConfigError(f"Test manifest is not valid YAML: {manifest_path}", [str(exc)]) from exc
     except OSError as exc:
@@ -243,6 +320,35 @@ def load_manifests(paths: list[str]) -> list[TestCaseSpec]:
     return specs
 
 
+def validate_delivery(specs: list[TestCaseSpec], execution_argv: list[str]) -> None:
+    """Check every test can actually receive its input.
+
+    ``file`` and ``argv`` delivery work by substituting ``{input}`` into the
+    command line. The global ``execution.argv`` is validated by the schema,
+    but a *per-test* delivery override can differ from the global default - a
+    suite whose global delivery is stdin may still contain one file-delivery
+    test. Without this check that test would run with the input silently
+    never reaching the program, and then "fail" for a reason that has nothing
+    to do with the patch.
+    """
+    problems: list[str] = []
+    global_argv = " ".join(execution_argv)
+
+    for spec in specs:
+        if spec.delivery not in (InputDelivery.FILE, InputDelivery.ARGV):
+            continue
+        combined = global_argv + " " + " ".join(spec.argv)
+        if "{input}" not in combined:
+            problems.append(
+                f"test '{spec.test_id}' uses delivery='{spec.delivery.value}' but "
+                "neither execution.argv nor the test's own argv contains {input}, "
+                "so the input would never reach the target"
+            )
+
+    if problems:
+        raise ConfigError("Test input delivery is misconfigured.", problems)
+
+
 def read_test_input(spec: TestCaseSpec) -> bytes:
     """Return the bytes a test delivers, from file or inline definition."""
     if spec.input_bytes is not None:
@@ -274,5 +380,17 @@ def has_independent_oracle(spec: TestCaseSpec) -> bool:
             bool(exp.stdout_contains),
             exp.stdout_regex is not None,
             bool(exp.stderr_contains),
+            # An assertion about a file the program writes is as concrete and
+            # falsifiable as one about stdout; without this, a program whose
+            # real output is a file could never support a regression claim.
+            #
+            # Bare existence does not count, though: "the file was created"
+            # is closer to must_not_crash than to a statement about what the
+            # program computed. Only asserted content - or an asserted
+            # absence - is a correctness criterion.
+            any(
+                output.has_content_assertion or not output.exists
+                for output in exp.output_files
+            ),
         )
     )

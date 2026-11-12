@@ -4,6 +4,19 @@ One schema serves the CLI, the web UI and CI. It is validated before any
 expensive work starts, and an invalid file produces a list of problems rather
 than a stack trace.
 
+## Strict YAML
+
+Configuration files and test manifests are parsed with duplicate mapping keys
+**rejected**. Standard YAML silently keeps the last of a repeated key, which
+in a configuration file is a trap: writing `build:` twice, or repeating a rule
+name in a grammar, would discard half of what you wrote with no diagnostic.
+
+```
+Configuration is not valid YAML.
+  - duplicate key 'version'; the later definition would silently replace the
+    earlier one
+```
+
 ## Path resolution
 
 **Every path in a configuration file resolves relative to the directory
@@ -211,8 +224,11 @@ the binary runs against the libc it was linked against.
 | --- | ---- | ------- | ------- |
 | `enabled` | list | `[]` | Extension names to activate. |
 | `llm` | object | disabled | See below. |
+| `fuzz` | object | disabled | See below. |
 
-An unknown name is a configuration error, not silently ignored.
+An unknown name is a configuration error, not silently ignored. Setting
+`<name>.enabled: true` without also listing `<name>` in `enabled` is rejected,
+so an extension cannot be half-switched-on.
 
 ### `extensions.llm`
 
@@ -230,6 +246,135 @@ An unknown name is a configuration error, not silently ignored.
 
 API keys are never stored in configuration, never logged and never returned by
 the API.
+
+### `extensions.fuzz`
+
+Grammar- and mutation-based fuzzing of the built targets.
+
+| Key | Type | Default | Meaning |
+| --- | ---- | ------- | ------- |
+| `enabled` | bool | `false` | Master switch. |
+| `iterations` | int | `300` | Inputs to execute per version. |
+| `time_budget_s` | float | `120` | Wall-clock ceiling per campaign. |
+| `max_findings` | int | `10` | Stop after this many distinct signatures. |
+| `seed` | int \| null | `1337` | PRNG seed. Fixed by default so a campaign is reproducible; `null` for a fresh corpus each run. |
+| `strategy` | `grammar` \| `mutation` \| `both` | `both` | Generation strategy. |
+| `grammar` | object | none | Required for `grammar`; optional for `both`. |
+| `max_input_bytes` | int | `8192` | Size cap on generated inputs. |
+| `versions` | list | `[base, patched]` | Which builds to fuzz. |
+| `profile` | `release` \| `sanitized` | `sanitized` | Build profile to fuzz. |
+| `confirm_replays` | int | `3` | Replays required to call a crash confirmed. |
+| `minimize` | bool | `true` | Minimise confirmed crashes. |
+| `minimization_max_iterations` | int | `150` | Minimisation budget. |
+| `promote_to_regression` | bool | `true` | Emit confirmed patched-only crashes into the regression suite. |
+| `delivery` | `stdin` \| `file` \| `argv` \| null | suite default | How generated inputs reach the target. |
+| `argv` | list | `[]` | Extra arguments for generated inputs; needed to place `{input}` when `delivery` is `file` or `argv`. |
+
+By default the fuzzer uses the suite's own `execution.delivery`, so generated
+inputs arrive exactly as hand-written ones do. Override it to fuzz a different
+surface — a target that reads both stdin and a named file has two attack
+surfaces, and fuzzing only one tests only half the program:
+
+```yaml
+    delivery: file
+    argv: ["{input}"]
+```
+
+#### Fuzz findings never change the exit code
+
+This is deliberate. The specification judges a patch *within the agreed test
+scope*, and a fuzzer invents inputs outside that scope by construction — if it
+could move the verdict, the same patch would pass or fail depending on a
+random seed.
+
+The promotion path is the honest alternative. A crash that is
+
+1. **confirmed** — reproduced `confirm_replays` times in a row,
+2. **minimised** — under the same signature-preserving predicate the core
+   pipeline uses, and
+3. **patched-only** — verified *not* to reproduce on the base build,
+
+is written into `tests.regression_suite`. The next run then evaluates it
+in scope, where it does affect the verdict — and by then it is a named,
+reviewable test rather than a lucky draw.
+
+A crash that also reproduces on the base version is reported as
+`pre_existing` and never promoted: it did not come from the patch. Fuzzing
+only the patched version makes that distinction impossible, so the doctor
+warns when `versions` omits `base`.
+
+#### `extensions.fuzz.grammar`
+
+Random bytes are rejected by a parser's first validity check, so they only
+ever exercise the error path. A grammar produces structurally plausible
+inputs that reach the deeper code a security patch usually touches.
+
+| Key | Type | Default | Meaning |
+| --- | ---- | ------- | ------- |
+| `start` | string | — | Non-terminal to start from. Must have a rule. |
+| `rules` | map | — | Non-terminal → list of alternatives. |
+| `max_depth` | int | `12` | Depth after which only cheapest-terminating alternatives are chosen. |
+
+Inside an alternative:
+
+| Syntax | Meaning |
+| ------ | ------- |
+| `{name}` | Expand rule `name`. |
+| `{{` | A literal `{`. |
+| `}}` | A literal `}`. |
+
+**A malformed reference is an error, not literal text.** `{ name }` (spaces),
+`{na-me}` (invalid character), `{name` (unterminated) and a stray `}` are all
+rejected at load time. Silently treating them as literals would mean a typo
+produces a fuzzer that quietly explores nothing.
+
+Recursion is fine and expected:
+
+```yaml
+grammar:
+  start: document
+  max_depth: 10
+  rules:
+    document:
+      - "{line}\n"
+      - "{line}\n{document}"      # recursive: safe
+    line:
+      - "{key}={value}"
+      - "{key}:{value}"
+      - "# {value}"
+      - ""
+    key: ["host", "port", "{ident}"]
+    ident: ["a", "k", "_"]
+    value:
+      - ""
+      - "localhost"
+      - "123456789012345"         # at the specified limit
+      - "1234567890123456"        # one past it
+      - "{chunk}{value}"          # recursive: safe
+    chunk: ["A", "AAAAAAAA", "0123456789abcdef"]
+```
+
+dynAn proves the grammar terminates **before** running it, by a fixpoint
+analysis over the rules. A rule needs no literal alternative of its own as
+long as it can reach literal text through others — `document → {line}`
+terminates because `line` does. Only a genuinely circular set, such as
+`a → {b}` with `b → {a}`, is rejected:
+
+```
+grammar rule(s) 'a', 'b' can never terminate: every alternative leads back
+into an endlessly recursive rule.
+```
+
+Past `max_depth` the generator restricts itself to the cheapest-terminating
+alternatives, so expansion always closes — termination is deterministic, not
+a matter of luck.
+
+`dynan doctor --config FILE` generates sample inputs from the grammar and
+reports them, so a grammar that cannot vary its output is caught before a
+campaign spends its budget on it.
+
+A complete worked example ships as
+[`configs/confparse-incomplete-fuzz.yaml`](../configs/confparse-incomplete-fuzz.yaml).
 
 ---
 
@@ -292,16 +437,92 @@ tests:
 | `max_duration_s` | Upper bound on runtime. |
 | `provenance` | Where the expectation came from. |
 
+### Input delivery
+
+A test receives its input through one of three mechanisms. `delivery` may be
+set per test, overriding `execution.delivery`.
+
+| `delivery` | How the input reaches the program |
+| ---------- | --------------------------------- |
+| `stdin` | Written to the process's standard input. |
+| `file` | Written to a file in the working directory; `{input}` in the command line expands to its path. |
+| `argv` | Decoded as text; `{input}` expands to it as a single argument. |
+| `none` | Nothing is delivered. |
+
+`file` and `argv` both work by substituting `{input}`, which must appear in
+`execution.argv` **or** in the test's own `argv`:
+
+```yaml
+  - id: delivery_file_input
+    delivery: file
+    argv: ["{input}"]            # the program takes a filename
+    input_file: inputs/valid_basic.txt
+
+  - id: delivery_argv_input
+    delivery: argv
+    argv: ["-c", "{input}"]      # the program takes the text inline
+    input: "host = localhost\n"
+```
+
+A `file` or `argv` test with no reachable `{input}` is a configuration error.
+Without that check the input would silently never arrive and the test would
+"fail" for a reason unrelated to the patch. `dynan doctor` reports it too.
+
+Binary inputs work with every mechanism; `argv` decodes them as UTF-8 with
+replacement, since a command-line argument cannot carry a NUL byte.
+
+### Checking files the program writes
+
+Many programs report their result through an output file rather than stdout.
+`output_file` (one entry) or `output_files` (a list) asserts on those.
+
+```yaml
+  - id: output_file_written
+    argv: ["-o", "result.txt"]
+    input_file: inputs/valid_basic.txt
+    expect:
+      exit_code: 0
+      stdout_exact: ""
+      output_file:
+        path: result.txt
+        exact: |
+          host=localhost
+          ok 1
+      provenance: "SPEC.md section 8"
+```
+
+| Key | Meaning |
+| --- | ------- |
+| `path` | Relative to the execution working directory. Absolute paths and `..` are rejected. |
+| `exists` | Default `true`. `false` asserts the file must **not** be there. |
+| `exact` | Full expected content. `exact: ""` means "exists and is empty" — distinct from absent. |
+| `contains` | String or list of required substrings. |
+| `regex` | Pattern searched with `MULTILINE`. |
+
+A bare string is shorthand for "must exist": `output_file: result.txt`.
+
+Declared files are read immediately after the process exits and stored as run
+artifacts, so the bytes the oracle checked are preserved as evidence and are
+visible in the web UI.
+
+Where to write: the working directory is a fresh per-execution scratch
+directory, so a relative path like `result.txt` is usually right. `{workdir}`
+expands to its absolute path if the program needs one.
+
 ### The independence rule
 
 An expectation counts as an **independent correctness oracle** only when it
 has both:
 
 1. a non-empty `provenance`, and
-2. at least one concrete assertion (`exit_code`, `stdout_exact`,
-   `stdout_contains`, `stdout_regex` or `stderr_contains`).
+2. at least one concrete assertion — `exit_code`, `stdout_exact`,
+   `stdout_contains`, `stdout_regex`, `stderr_contains`, or an output file
+   with asserted content (`exact`, `contains`, `regex`) or asserted absence
+   (`exists: false`).
 
-`must_not_crash` alone is a safety check, not a functional criterion.
+`must_not_crash` alone is a safety check, not a functional criterion. So is a
+bare `output_file: result.txt`: "the file was created" says nothing about what
+the program computed, so it does not license a regression claim either.
 
 This matters because **a functional regression can only be claimed against an
 independent oracle**. The specification forbids treating the patched program's

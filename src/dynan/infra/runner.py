@@ -24,7 +24,13 @@ from ..domain.enums import (
     InputDelivery,
     Version,
 )
-from ..domain.models import BuildResult, ExecutionResult, ResourceUsage, TestCaseSpec
+from ..domain.models import (
+    BuildResult,
+    CapturedFile,
+    ExecutionResult,
+    ResourceUsage,
+    TestCaseSpec,
+)
 from .process import ExecSpec, run_process, sanitizer_env
 from .sandbox import Sandbox
 from .store import RunStore
@@ -181,6 +187,7 @@ class TargetRunner:
         )
 
         raw = run_process(self.sandbox.wrap(spec))
+        captured = self._capture_outputs(test, cwd)
 
         result = ExecutionResult(
             execution_id=request.execution_id,
@@ -209,6 +216,7 @@ class TargetRunner:
             ),
             sandbox=self.sandbox.name,
             spawn_error=raw.spawn_error,
+            output_files=captured,
         )
 
         if request.persist:
@@ -220,6 +228,71 @@ class TargetRunner:
             shutil.rmtree(scratch, ignore_errors=True)
 
         return result
+
+    def _capture_outputs(
+        self, test: TestCaseSpec, cwd: Path
+    ) -> list[CapturedFile]:
+        """Read back the files a test declared as outputs.
+
+        Done immediately after the process exits and before the scratch
+        directory can be reused, so the bytes checked by the oracle are the
+        bytes that execution actually produced.
+        """
+        captured: list[CapturedFile] = []
+        limit = self.config.execution.max_output_bytes
+
+        for expectation in test.expectation.output_files:
+            declared = expectation.path
+            resolved = (cwd / declared).resolve()
+
+            # A manifest is user input; an output path must not escape the
+            # working directory into the rest of the filesystem.
+            try:
+                resolved.relative_to(cwd.resolve())
+            except ValueError:
+                captured.append(
+                    CapturedFile(
+                        path=declared,
+                        exists=False,
+                        error=(
+                            f"output path {declared!r} escapes the execution "
+                            "working directory and was not read"
+                        ),
+                    )
+                )
+                continue
+
+            if not resolved.exists():
+                captured.append(CapturedFile(path=declared, exists=False))
+                continue
+            if not resolved.is_file():
+                captured.append(
+                    CapturedFile(
+                        path=declared, exists=False, error="path is not a regular file"
+                    )
+                )
+                continue
+
+            try:
+                data = resolved.read_bytes()
+            except OSError as exc:
+                captured.append(
+                    CapturedFile(path=declared, exists=True, error=str(exc))
+                )
+                continue
+
+            truncated = len(data) > limit
+            captured.append(
+                CapturedFile(
+                    path=declared,
+                    exists=True,
+                    size=len(data),
+                    text=data[:limit].decode("utf-8", errors="replace"),
+                    truncated=truncated,
+                )
+            )
+
+        return captured
 
     def _persist(
         self, result: ExecutionResult, input_bytes: bytes, stdout: bytes, stderr: bytes
@@ -235,6 +308,15 @@ class TargetRunner:
         result.stderr_artifact = self.store.write_artifact(
             self.run_id, f"{prefix}/stderr.log", stderr
         )
+        for index, captured in enumerate(result.output_files):
+            if not captured.exists:
+                continue
+            safe_name = captured.path.replace("/", "_") or f"output{index}"
+            captured.artifact = self.store.write_artifact(
+                self.run_id,
+                f"{prefix}/outputs/{safe_name}",
+                captured.text.encode("utf-8", errors="replace"),
+            )
 
 
 def describe_command(result: ExecutionResult) -> str:

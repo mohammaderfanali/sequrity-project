@@ -19,9 +19,10 @@ import random
 from dataclasses import dataclass, field
 
 from ...config.schema import (
-    GRAMMAR_REFERENCE as _REFERENCE,
     GrammarConfig,
+    GrammarToken,
     grammar_expansion_costs,
+    tokenize_grammar_alternative,
 )
 
 #: Guards against a pathological grammar producing an enormous string before
@@ -38,28 +39,37 @@ class Grammar:
     """A validated, ready-to-expand grammar."""
 
     start: str
-    rules: dict[str, list[str]]
+    #: Alternatives pre-tokenised once, so expansion never re-parses braces
+    #: and cannot interpret them differently from validation.
+    rules: dict[str, list[tuple[GrammarToken, ...]]]
     max_depth: int
     #: Cheapest expansion cost per rule, from the productivity analysis.
     costs: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, config: GrammarConfig) -> Grammar:
-        rules = {name: list(alts) for name, alts in config.rules.items()}
+        raw = {name: list(alts) for name, alts in config.rules.items()}
+        tokenised = {
+            name: [
+                tokenize_grammar_alternative(alt, where=f"grammar rule '{name}'")
+                for alt in alternatives
+            ]
+            for name, alternatives in raw.items()
+        }
         return cls(
             start=config.start,
-            rules=rules,
+            rules=tokenised,
             max_depth=config.max_depth,
-            costs=grammar_expansion_costs(rules),
+            costs=grammar_expansion_costs(raw),
         )
 
-    def _alternative_cost(self, alternative: str) -> int:
-        references = _REFERENCE.findall(alternative)
+    def _alternative_cost(self, alternative: tuple[GrammarToken, ...]) -> int:
+        references = [t.value for t in alternative if t.is_reference]
         if not references:
             return 0
         return 1 + max(self.costs.get(ref, 0) for ref in references)
 
-    def closing_alternatives(self, name: str) -> list[str]:
+    def closing_alternatives(self, name: str) -> list[tuple[GrammarToken, ...]]:
         """Cheapest-to-terminate alternatives of ``name``.
 
         Used once the depth budget is spent. Choosing a minimum-cost
@@ -89,26 +99,20 @@ class Grammar:
 
         chosen = rng.choice(alternatives)
         out: list[str] = []
-        cursor = 0
         length = 0
 
-        for match in _REFERENCE.finditer(chosen):
-            literal = chosen[cursor : match.start()]
-            out.append(literal)
-            length += len(literal)
-            expanded = self._expand(match.group(1), rng, depth=depth + 1)
-            out.append(expanded)
-            length += len(expanded)
+        for token in chosen:
+            if token.is_reference:
+                piece = self._expand(token.value, rng, depth=depth + 1)
+            else:
+                # Literal text, with braces already unescaped by the tokeniser.
+                piece = token.value
+            out.append(piece)
+            length += len(piece)
             if length > _HARD_EXPANSION_LIMIT:
                 raise GrammarError(
                     f"grammar expansion exceeded {_HARD_EXPANSION_LIMIT} characters; "
                     "check for an unbounded recursive rule"
                 )
-            cursor = match.end()
 
-        out.append(chosen[cursor:])
-        return _unescape_braces("".join(out))
-
-
-def _unescape_braces(text: str) -> str:
-    return text.replace("{{", "{").replace("}}", "}")
+        return "".join(out)

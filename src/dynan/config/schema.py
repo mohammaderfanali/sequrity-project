@@ -12,6 +12,7 @@ Design goals, in order:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -353,8 +354,96 @@ class LlmConfig(Base):
     max_prompt_chars: int = 24_000
 
 
-#: ``{name}`` is a reference; ``{{`` / ``}}`` are literal braces.
-GRAMMAR_REFERENCE = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_GRAMMAR_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+@dataclass(frozen=True, slots=True)
+class GrammarToken:
+    """One piece of a grammar alternative: literal text or a reference."""
+
+    is_reference: bool
+    value: str
+
+
+def tokenize_grammar_alternative(
+    text: str, *, where: str = "grammar alternative"
+) -> tuple[GrammarToken, ...]:
+    """Split an alternative into literals and references.
+
+    A single left-to-right scan rather than a regular expression. The regex
+    approach that this replaced used a negative lookbehind to skip ``{{``, and
+    it got ``{{{b}}}`` wrong - the inner reference went unexpanded - because a
+    lookbehind cannot tell an escaped brace from the start of a reference once
+    they are adjacent.
+
+    Malformed references are **errors**, not literal text. Silently treating
+    ``{ value }`` or ``{valu`` as literal means a typo in a grammar produces a
+    fuzzer that quietly explores nothing, with no diagnostic anywhere.
+
+    Grammar:
+
+    * ``{{`` -> literal ``{``
+    * ``}}`` -> literal ``}``
+    * ``{name}`` -> reference to rule ``name``
+    * any other ``{`` or ``}`` -> error
+    """
+    tokens: list[GrammarToken] = []
+    literal: list[str] = []
+    index = 0
+    length = len(text)
+
+    def flush() -> None:
+        if literal:
+            tokens.append(GrammarToken(False, "".join(literal)))
+            literal.clear()
+
+    while index < length:
+        char = text[index]
+
+        if char == "{":
+            if index + 1 < length and text[index + 1] == "{":
+                literal.append("{")
+                index += 2
+                continue
+            close = text.find("}", index + 1)
+            if close == -1:
+                raise ValueError(
+                    f"{where}: unterminated '{{' in {text!r}. "
+                    "Write '{{' for a literal opening brace."
+                )
+            name = text[index + 1 : close]
+            if not _GRAMMAR_IDENT.fullmatch(name):
+                raise ValueError(
+                    f"{where}: {'{' + name + '}'!r} in {text!r} is not a valid "
+                    "reference. A reference is '{name}' with no spaces, where "
+                    "name matches [A-Za-z_][A-Za-z0-9_]*. Write '{{' and '}}' "
+                    "for literal braces."
+                )
+            flush()
+            tokens.append(GrammarToken(True, name))
+            index = close + 1
+            continue
+
+        if char == "}":
+            if index + 1 < length and text[index + 1] == "}":
+                literal.append("}")
+                index += 2
+                continue
+            raise ValueError(
+                f"{where}: stray '}}' in {text!r}. "
+                "Write '}}' for a literal closing brace."
+            )
+
+        literal.append(char)
+        index += 1
+
+    flush()
+    return tuple(tokens)
+
+
+def grammar_references(text: str, *, where: str = "grammar alternative") -> list[str]:
+    """Rule names referenced by one alternative."""
+    return [t.value for t in tokenize_grammar_alternative(text, where=where) if t.is_reference]
 
 
 def grammar_expansion_costs(rules: dict[str, list[str]]) -> dict[str, int]:
@@ -380,7 +469,9 @@ def grammar_expansion_costs(rules: dict[str, list[str]]) -> dict[str, int]:
         for name, alternatives in rules.items():
             best: int | None = None
             for alternative in alternatives:
-                references = GRAMMAR_REFERENCE.findall(alternative)
+                references = grammar_references(
+                    alternative, where=f"grammar rule '{name}'"
+                )
                 if not references:
                     candidate = 0
                 elif all(ref in costs for ref in references):
@@ -439,7 +530,11 @@ class GrammarConfig(Base):
             if not alternatives:
                 raise ValueError(f"grammar rule '{name}' has no alternatives")
             for alternative in alternatives:
-                for referenced in GRAMMAR_REFERENCE.findall(alternative):
+                # Tokenising here is what turns a malformed reference into a
+                # configuration error instead of silent literal text.
+                for referenced in grammar_references(
+                    alternative, where=f"grammar rule '{name}'"
+                ):
                     if referenced not in self.rules:
                         raise ValueError(
                             f"grammar rule '{name}' references undefined "
@@ -473,6 +568,15 @@ class FuzzConfig(Base):
     #: "grammar" needs `grammar`; "mutation" mutates the existing test inputs;
     #: "both" alternates between them.
     strategy: Literal["grammar", "mutation", "both"] = "both"
+    #: How generated inputs reach the target. Defaults to the suite's own
+    #: ``execution.delivery``; set it to fuzz a different mechanism - a target
+    #: that reads both stdin and a named file has two attack surfaces, and
+    #: fuzzing only one of them tests only half the program.
+    delivery: InputDelivery | None = None
+    #: Extra arguments appended to ``execution.argv`` for generated inputs,
+    #: exactly like a test case's own ``argv``. Needed when ``delivery`` is
+    #: ``file`` or ``argv``, to place the ``{input}`` placeholder.
+    argv: list[str] = Field(default_factory=list)
     grammar: GrammarConfig | None = None
     #: Which versions to fuzz. Fuzzing the patched build looks for defects the
     #: patch introduced or left behind; including the base lets dynAn tell the
@@ -559,3 +663,29 @@ class DynanConfig(Base):
                 f"this build of dynAn understands version {CONFIG_VERSION}"
             )
         return self
+
+    @model_validator(mode="after")
+    def _check_fuzz_delivery(self) -> DynanConfig:
+        """A fuzz campaign must be able to deliver its generated input.
+
+        Checked here rather than inside ``FuzzConfig`` because it depends on
+        ``execution.argv``, which lives in a sibling section.
+        """
+        fuzz = self.extensions.fuzz
+        if not fuzz.enabled:
+            return self
+
+        delivery = fuzz.delivery or self.execution.delivery
+        if delivery in (InputDelivery.FILE, InputDelivery.ARGV):
+            combined = " ".join([*self.execution.argv, *fuzz.argv])
+            if "{input}" not in combined:
+                raise ValueError(
+                    f"extensions.fuzz delivery is '{delivery.value}' but neither "
+                    "execution.argv nor extensions.fuzz.argv contains {input}, "
+                    "so generated inputs would never reach the target"
+                )
+        return self
+
+    def fuzz_delivery(self) -> InputDelivery:
+        """Effective delivery mechanism for generated fuzz inputs."""
+        return self.extensions.fuzz.delivery or self.execution.delivery

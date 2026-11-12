@@ -158,11 +158,42 @@ Legend: ✅ complete · 🟡 partial · ❌ not implemented
 
 Items 1–4 are target-authoring work and need no changes to dynAn itself.
 
+## Beyond the specification
+
+These are not PDF requirements. They are listed so a reviewer can tell
+optional work apart from mandatory work, and so that nothing optional is
+mistaken for a graded capability.
+
+| Capability | Implementation | Verification | Status |
+| ---------- | -------------- | ------------ | ------ |
+| Optional LLM advisor, disabled by default | `ext/llm/` | `test_e2e.py::test_disabled_llm_extension_makes_no_requests` | ✅ |
+| Optional fuzzing, disabled by default | `ext/fuzz/` | `test_fuzz.py` (42 tests) | ✅ |
+| Grammar-based input generation | `ext/fuzz/grammar.py`, schema tokeniser | `test_fuzz.py::test_escaped_braces_expand_correctly`, `::test_malformed_braces_are_rejected` | ✅ |
+| Fuzz crash triage: confirm, minimise, attribute | `ext/fuzz/triage.py` | `test_fuzz.py::test_only_confirmed_patched_only_crashes_are_promotable` | ✅ |
+| Fuzz findings excluded from the verdict | `decision.py` never reads `extension_results` | `test_fuzz.py::test_extension_results_cannot_change_the_verdict` | ✅ |
+
+The fuzzer deliberately does **not** influence the exit code. PDF §3.5 judges
+a patch within the agreed test scope, and a fuzzer generates inputs outside
+it; a verdict that shifted with the random seed would not be reproducible,
+which §6.1 requires. Confirmed patched-only crashes are instead promoted into
+the regression suite, so a later run evaluates them in scope.
+
+Verified end to end on the incomplete patch: 800 generated inputs across both
+versions found the `store_value` overflow, minimised it from 182 to 18 bytes,
+correctly attributed it as `pre_existing` (the base build crashes the same
+way), promoted nothing, and left the exit code at 10.
+
 ## Reproducing this matrix
 
 ```bash
-pytest -q                         # 71 tests
+pytest -q                         # 113 tests
 dynan validate --config configs/confparse-correct.yaml      # exit 0
 dynan validate --config configs/confparse-incomplete.yaml   # exit 10
 dynan validate --config configs/confparse-regression.yaml   # exit 20
+```
+
+Optional, with fuzzing enabled — the verdict must be unchanged at 10:
+
+```bash
+dynan validate --config configs/confparse-incomplete-fuzz.yaml
 ```

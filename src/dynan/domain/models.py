@@ -295,6 +295,8 @@ class ExecutionResult(Model):
     stderr_artifact: str | None = None
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    #: Files the test declared as outputs, captured after the run.
+    output_files: list[CapturedFile] = Field(default_factory=list)
     duration_s: float = 0.0
     timeout_s: float | None = None
     usage: ResourceUsage = Field(default_factory=ResourceUsage)
@@ -435,6 +437,46 @@ class FindingCorrelation(Model):
 # --------------------------------------------------------------------------
 
 
+class OutputFileExpectation(Model):
+    """Assertion about a file the target is expected to write.
+
+    Many real programs report their result through an output file rather than
+    stdout, so a validator that can only read stdout cannot express their
+    correctness criterion at all.
+
+    ``path`` is relative to the execution's working directory, which is the
+    per-execution scratch directory unless ``execution.working_dir`` says
+    otherwise.
+    """
+
+    path: str
+    #: False asserts the file must *not* exist - useful for checking that a
+    #: rejected input produced no partial output.
+    exists: bool = True
+    exact: str | None = None
+    contains: list[str] = Field(default_factory=list)
+    regex: str | None = None
+
+    @property
+    def has_content_assertion(self) -> bool:
+        return self.exact is not None or bool(self.contains) or self.regex is not None
+
+
+class CapturedFile(Model):
+    """A declared output file as it was found after an execution."""
+
+    path: str
+    exists: bool
+    size: int = 0
+    #: Run-relative artifact holding the bytes, so the evidence survives.
+    artifact: str | None = None
+    #: Decoded content, bounded for display and matching.
+    text: str = ""
+    truncated: bool = False
+    #: Populated when the file could not be read at all.
+    error: str | None = None
+
+
 class OracleExpectation(Model):
     """What the independent oracle says *should* happen.
 
@@ -447,6 +489,8 @@ class OracleExpectation(Model):
     stdout_contains: list[str] = Field(default_factory=list)
     stdout_regex: str | None = None
     stderr_contains: list[str] = Field(default_factory=list)
+    #: Assertions about files the target writes.
+    output_files: list[OutputFileExpectation] = Field(default_factory=list)
     must_not_crash: bool = True
     max_duration_s: float | None = None
     provenance: str = "unspecified"

@@ -71,6 +71,9 @@ static int store_value(char *dst, size_t dst_size, const char *src)
     return 0;
 }
 
+/* Destination for accepted entries; see main(). */
+static FILE *g_out;
+
 static int emit_pair(const char *key, const char *raw_value, int lineno)
 {
     char value[MAX_VALUE + 1];
@@ -80,7 +83,7 @@ static int emit_pair(const char *key, const char *raw_value, int lineno)
         return -1;
     }
 
-    printf("%s=%s\n", key, value);
+    fprintf(g_out, "%s=%s\n", key, value);
     return 0;
 }
 
@@ -144,13 +147,21 @@ static int handle_line(char *line, int lineno)
     return parse_colon(line, colon, lineno) == 0 ? 1 : -1;
 }
 
-int main(void)
+static void usage(const char *program)
+{
+    fprintf(stderr,
+            "usage: %s [INPUT_FILE] [-c TEXT] [-o OUTPUT_FILE]\n"
+            "  no INPUT_FILE and no -c: read standard input\n",
+            program);
+}
+
+static int process(FILE *in)
 {
     char line[LINE_BUF];
     int lineno = 0;
     int accepted = 0;
 
-    while (fgets(line, sizeof(line), stdin) != NULL) {
+    while (fgets(line, sizeof(line), in) != NULL) {
         lineno++;
         size_t len = strlen(line);
         if (len > 0 && line[len - 1] == '\n') {
@@ -159,12 +170,81 @@ int main(void)
 
         int result = handle_line(line, lineno);
         if (result < 0) {
-            fflush(stdout);
-            return 2;
+            return -1;
         }
         accepted += result;
     }
 
-    printf("ok %d\n", accepted);
+    fprintf(g_out, "ok %d\n", accepted);
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    const char *input_path = NULL;
+    const char *output_path = NULL;
+    const char *inline_text = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (++i >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            output_path = argv[i];
+        } else if (strcmp(argv[i], "-c") == 0) {
+            if (++i >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            inline_text = argv[i];
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            usage(argv[0]);
+            return 2;
+        } else {
+            input_path = argv[i];
+        }
+    }
+
+    if (inline_text != NULL && input_path != NULL) {
+        fprintf(stderr, "error: give either INPUT_FILE or -c, not both\n");
+        return 2;
+    }
+
+    FILE *in = stdin;
+    if (inline_text != NULL) {
+        in = fmemopen((void *)inline_text, strlen(inline_text), "r");
+        if (in == NULL) {
+            fprintf(stderr, "error: cannot read inline text\n");
+            return 2;
+        }
+    } else if (input_path != NULL) {
+        in = fopen(input_path, "r");
+        if (in == NULL) {
+            fprintf(stderr, "error: cannot open input file '%s'\n", input_path);
+            return 2;
+        }
+    }
+
+    g_out = stdout;
+    FILE *out_file = NULL;
+    if (output_path != NULL) {
+        out_file = fopen(output_path, "w");
+        if (out_file == NULL) {
+            fprintf(stderr, "error: cannot open output file '%s'\n", output_path);
+            return 2;
+        }
+        g_out = out_file;
+    }
+
+    int status = process(in) < 0 ? 2 : 0;
+
+    fflush(g_out);
+    if (out_file != NULL) {
+        fclose(out_file);
+    }
+    if (in != stdin) {
+        fclose(in);
+    }
+    return status;
 }

@@ -20,6 +20,43 @@ from pydantic import ValidationError
 from .schema import DynanConfig
 
 
+class StrictLoader(yaml.SafeLoader):
+    """YAML loader that rejects duplicate mapping keys.
+
+    PyYAML's default silently keeps the last of a repeated key. In a
+    configuration file that is a trap: writing ``value:`` twice in a grammar,
+    or ``build:`` twice in a config, discards half of what the author wrote
+    with no diagnostic. Every dynAn YAML file is parsed through this loader so
+    the mistake is an error instead.
+    """
+
+
+def _construct_mapping_no_duplicates(loader: StrictLoader, node, deep: bool = False):
+    mapping: dict = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"duplicate key {key!r}; the later definition would silently "
+                "replace the earlier one",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping_no_duplicates
+)
+
+
+def safe_load_strict(text: str):
+    """Parse YAML, rejecting duplicate keys. Raises ``yaml.YAMLError``."""
+    return yaml.load(text, Loader=StrictLoader)
+
+
 class ConfigError(Exception):
     """Raised for unreadable, malformed or semantically invalid configuration.
 
@@ -71,7 +108,7 @@ def load_config_text(
     configuration without writing it to disk first.
     """
     try:
-        raw = yaml.safe_load(text)
+        raw = safe_load_strict(text)
     except yaml.YAMLError as exc:
         raise ConfigError("Configuration is not valid YAML.", [str(exc)]) from exc
 
