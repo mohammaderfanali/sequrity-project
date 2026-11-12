@@ -1,0 +1,158 @@
+# dynAn configuration - confparse / incomplete patch, with fuzzing enabled.
+#
+# Expected verdict: exit 10 (VULN_REMAINS), identical to
+# confparse-incomplete.yaml. Enabling the fuzzer must not change the
+# authoritative result - that is the point of keeping it non-authoritative.
+#
+# All paths are relative to this file.
+version: 1
+
+target:
+  name: confparse-incomplete-fuzz
+  description: "Incomplete patch, validated with the optional fuzzing extension."
+  language: c
+
+source:
+  mode: directories
+  base_path: ../targets/confparse/base
+  patched_path: ../targets/confparse/incomplete
+
+build:
+  working_dir: "."
+  binary: build/confparse
+  commands:
+    - ["make", "clean"]
+    - ["make"]
+  env:
+    CC: gcc
+  timeout_s: 300
+
+execution:
+  argv: ["{binary}"]
+  delivery: stdin
+  timeout_s: 10
+  limits:
+    memory_mb: 1024
+    cpu_s: 10
+
+tests:
+  manifests:
+    - ../targets/confparse/tests/manifest.yaml
+  regression_suite: ../regression-suite/confparse-incomplete-fuzz
+
+sandbox:
+  backend: bwrap
+
+analysis:
+  replay_count: 3
+  minimize: true
+  generate_regression_tests: true
+
+artifacts:
+  root: ../.dynan
+
+extensions:
+  enabled: [fuzz]
+
+  fuzz:
+    enabled: true
+
+    # Budgets. The campaign stops at whichever runs out first.
+    iterations: 400
+    time_budget_s: 90
+    max_findings: 8
+
+    # A fixed seed makes a campaign reproducible, which matters when a run is
+    # evidence. Set to null for a different corpus each time.
+    seed: 1337
+
+    # "grammar" only expands the grammar, "mutation" only mutates the existing
+    # test inputs, "both" alternates and is usually the best default.
+    strategy: both
+    max_input_bytes: 4096
+
+    # Fuzz both versions. Without the base version a crash that already
+    # existed before the patch cannot be told apart from one the patch
+    # introduced, and dynAn refuses to guess.
+    versions: [base, patched]
+
+    # The instrumented build. An uninstrumented binary silently tolerates
+    # most of what a fuzzer finds.
+    profile: sanitized
+
+    # Triage: replay each candidate crash this many times, then minimise it
+    # under the same signature-preserving predicate the core pipeline uses.
+    confirm_replays: 3
+    minimize: true
+    minimization_max_iterations: 150
+
+    # Confirmed, patched-only crashes become regression tests. They do not
+    # affect this run's exit code; they put the input in scope for the next.
+    promote_to_regression: true
+
+    # ------------------------------------------------------------------
+    # Grammar for the confparse input format (see targets/confparse/SPEC.md).
+    #
+    # `{name}` expands the rule `name`; anything else is literal text. Use
+    # `{{` and `}}` for literal braces.
+    #
+    # Recursion is fine: past `max_depth` the generator only picks
+    # alternatives that contain no references, so expansion always terminates.
+    # Every rule must therefore have at least one such alternative - the
+    # schema rejects the grammar otherwise, rather than hanging at run time.
+    # ------------------------------------------------------------------
+    grammar:
+      start: document
+      max_depth: 10
+
+      rules:
+        # A document is one or more lines.
+        document:
+          - "{line}\n"
+          - "{line}\n{document}"
+
+        # Both separators, comments, blank lines, and deliberately malformed
+        # lines - the fuzzer should exercise the error paths too.
+        line:
+          - "{key}={value}"
+          - "{key}:{value}"
+          - "{key} = {value}"
+          - "# {value}"
+          - ""
+          - "{key}"
+          - "={value}"
+          - "{key}={value}={value}"
+
+        key:
+          - "host"
+          - "port"
+          - "name"
+          - "flag"
+          - "{ident}"
+          - "{ident}{key}"
+
+        ident:
+          - "a"
+          - "k"
+          - "_"
+          - "0"
+          - "x9"
+
+        # Values span the specified limit of 15 characters in both
+        # directions, so boundary behaviour gets exercised rather than only
+        # the comfortable middle.
+        value:
+          - ""
+          - "1"
+          - "localhost"
+          - "123456789012345"
+          - "1234567890123456"
+          - "{chunk}"
+          - "{chunk}{value}"
+
+        chunk:
+          - "A"
+          - "AAAAAAAA"
+          - "AAAAAAAAAAAAAAAA"
+          - "0123456789abcdef"
+          - " "

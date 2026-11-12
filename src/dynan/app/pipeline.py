@@ -839,23 +839,41 @@ class ValidationPipeline:
             return
 
         self.emitter.start_stage(Stage.EXTENSIONS, f"running {len(extensions)} extension(s)")
+
+        # An extension that executes the target reuses the pipeline's own
+        # runner, so generated inputs go through the same sandbox, the same
+        # limits and the same classifier as the core test suite.
+        runnable = all(build.success for build in self.state.builds.values())
         context = ExtensionContext(
             config=self.config,
             run=self.run,
             source_roots=[str(p) for p in self.state.source_roots],
             raw_diff=self.state.raw_diff,
+            runner=self._runner() if runnable else None,
+            builds={
+                build.key: build
+                for build in self.state.builds.values()
+                if build.success
+            },
+            tests=list(self.state.tests),
+            inputs=dict(self.state.inputs),
+            store=self.store,
+            run_id=self.run_id,
         )
 
         for extension in extensions:
             try:
-                self.run.extension_results[extension.name] = extension.run(context)
+                result = extension.run(context)
             except Exception as exc:
                 # An advisory feature must never break a validation.
-                self.run.extension_results[extension.name] = {
-                    "status": "failed",
-                    "error": str(exc),
-                }
+                result = {"status": "failed", "error": str(exc)}
                 self.run.warnings.append(f"extension '{extension.name}' failed: {exc}")
+            self.run.extension_results[extension.name] = result
+            self.emitter.emit(
+                f"extension '{extension.name}': {_describe_extension(result)}",
+                stage=Stage.EXTENSIONS,
+                level="warning" if result.get("status") == "failed" else "info",
+            )
 
         self.emitter.finish_stage(
             Stage.EXTENSIONS,
@@ -969,6 +987,30 @@ def compare_hardening(
         )
 
     return changes
+
+
+def _describe_extension(result: dict) -> str:
+    """One-line summary of an extension's output for the progress log."""
+    status = result.get("status", "ok")
+    if status != "ok":
+        return f"{status}" + (f" ({result['error']})" if result.get("error") else "")
+
+    parts: list[str] = []
+    findings = result.get("findings")
+    if isinstance(findings, list):
+        confirmed = sum(1 for f in findings if isinstance(f, dict) and f.get("confirmed"))
+        parts.append(f"{len(findings)} finding(s), {confirmed} confirmed")
+    promoted = result.get("promoted_tests")
+    if isinstance(promoted, list) and promoted:
+        parts.append(f"{len(promoted)} promoted to the regression suite")
+    executed = sum(
+        c.get("executed", 0)
+        for c in result.get("campaigns", [])
+        if isinstance(c, dict)
+    )
+    if executed:
+        parts.insert(0, f"{executed} input(s) executed")
+    return "; ".join(parts) or status
 
 
 def _safe(value: str) -> str:

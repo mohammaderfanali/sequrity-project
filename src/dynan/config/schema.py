@@ -11,11 +11,12 @@ Design goals, in order:
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..domain.enums import BuildProfile, InputDelivery
+from ..domain.enums import BuildProfile, InputDelivery, Version
 
 #: Current configuration format version. Bump when a breaking change lands.
 CONFIG_VERSION = 1
@@ -352,18 +353,179 @@ class LlmConfig(Base):
     max_prompt_chars: int = 24_000
 
 
+#: ``{name}`` is a reference; ``{{`` / ``}}`` are literal braces.
+GRAMMAR_REFERENCE = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def grammar_expansion_costs(rules: dict[str, list[str]]) -> dict[str, int]:
+    """Cheapest number of expansion steps each rule needs to terminate.
+
+    A rule is *productive* when at least one of its alternatives can be fully
+    expanded into literal text in finitely many steps. Requiring every rule to
+    have a reference-free alternative would be too strict - ``document:
+    ["{line}"]`` terminates perfectly well when ``line`` does - so this
+    computes the real property by fixpoint instead.
+
+    The costs are also what makes generation terminate deterministically: past
+    the depth budget the generator picks a cheapest alternative, which always
+    closes the branch.
+
+    Raises ``ValueError`` naming the rules that can never terminate.
+    """
+    costs: dict[str, int] = {}
+
+    changed = True
+    while changed:
+        changed = False
+        for name, alternatives in rules.items():
+            best: int | None = None
+            for alternative in alternatives:
+                references = GRAMMAR_REFERENCE.findall(alternative)
+                if not references:
+                    candidate = 0
+                elif all(ref in costs for ref in references):
+                    candidate = 1 + max(costs[ref] for ref in references)
+                else:
+                    continue
+                if best is None or candidate < best:
+                    best = candidate
+            if best is not None and (name not in costs or best < costs[name]):
+                costs[name] = best
+                changed = True
+
+    unproductive = sorted(set(rules) - set(costs))
+    if unproductive:
+        raise ValueError(
+            "grammar rule(s) "
+            + ", ".join(f"'{name}'" for name in unproductive)
+            + " can never terminate: every alternative leads back into an "
+            "endlessly recursive rule. Give at least one of them an "
+            "alternative that reaches literal text."
+        )
+    return costs
+
+
+class GrammarConfig(Base):
+    """A context-free grammar used to generate structurally valid inputs.
+
+    Purely random bytes almost never get past a parser's first validity check,
+    so they only ever exercise the rejection path. A grammar lets the fuzzer
+    produce inputs that reach the deeper code the patch actually touches.
+
+    Format: ``rules`` maps a non-terminal to its alternatives. Inside an
+    alternative, ``{name}`` expands the non-terminal ``name``; everything else
+    is a literal. Use ``{{`` and ``}}`` for literal braces.
+
+    Termination is guaranteed by ``max_depth``: past that depth the generator
+    only picks alternatives that contain no references, so a left-recursive
+    rule like ``value: ["x", "{value}{value}"]`` is safe.
+    """
+
+    #: Non-terminal the generator starts from.
+    start: str = Field(..., min_length=1)
+    rules: dict[str, list[str]] = Field(..., min_length=1)
+    #: Expansion depth after which only terminal alternatives are chosen.
+    max_depth: Annotated[int, Field(ge=1, le=64)] = 12
+
+    @model_validator(mode="after")
+    def _check(self) -> GrammarConfig:
+        if self.start not in self.rules:
+            raise ValueError(
+                f"grammar.start '{self.start}' has no rule; "
+                f"defined rules: {', '.join(sorted(self.rules))}"
+            )
+
+        for name, alternatives in self.rules.items():
+            if not alternatives:
+                raise ValueError(f"grammar rule '{name}' has no alternatives")
+            for alternative in alternatives:
+                for referenced in GRAMMAR_REFERENCE.findall(alternative):
+                    if referenced not in self.rules:
+                        raise ValueError(
+                            f"grammar rule '{name}' references undefined "
+                            f"non-terminal '{referenced}'"
+                        )
+
+        # Proves the grammar terminates before a run ever expands it.
+        grammar_expansion_costs(self.rules)
+        return self
+
+
+class FuzzConfig(Base):
+    """Optional grammar- and mutation-based fuzzing.
+
+    Findings from fuzzing are reported separately and never alter the official
+    exit code: the specification judges a patch within the agreed test scope,
+    and a fuzzer by definition invents inputs outside it. The honest path from
+    a fuzz crash to the verdict is ``promote_to_regression`` - the input
+    becomes a regression test, so the *next* run has it legitimately in scope.
+    """
+
+    enabled: bool = False
+    #: Number of generated inputs to execute. The budget that matters most.
+    iterations: Annotated[int, Field(ge=1, le=1_000_000)] = 300
+    #: Wall-clock ceiling for the whole campaign.
+    time_budget_s: float = 120.0
+    #: Seed for the PRNG. Fixed by default so campaigns are reproducible;
+    #: set to null for a different corpus on every run.
+    seed: int | None = 1337
+    max_input_bytes: Annotated[int, Field(ge=1)] = 8192
+    #: "grammar" needs `grammar`; "mutation" mutates the existing test inputs;
+    #: "both" alternates between them.
+    strategy: Literal["grammar", "mutation", "both"] = "both"
+    grammar: GrammarConfig | None = None
+    #: Which versions to fuzz. Fuzzing the patched build looks for defects the
+    #: patch introduced or left behind; including the base lets dynAn tell the
+    #: two apart instead of reporting a pre-existing bug as new.
+    versions: list[Version] = Field(
+        default_factory=lambda: [Version.BASE, Version.PATCHED]
+    )
+    #: Instrumented build by default - an uninstrumented binary silently
+    #: tolerates most of what a fuzzer finds.
+    profile: BuildProfile = BuildProfile.SANITIZED
+    #: Re-run each candidate crash to separate real defects from flakes.
+    confirm_replays: Annotated[int, Field(ge=1)] = 3
+    minimize: bool = True
+    minimization_max_iterations: Annotated[int, Field(ge=1)] = 150
+    #: Emit confirmed, patched-version-only crashes into the regression suite.
+    promote_to_regression: bool = True
+    #: Stop after this many distinct signatures, so one noisy defect cannot
+    #: consume the whole budget.
+    max_findings: Annotated[int, Field(ge=1)] = 10
+
+    @model_validator(mode="after")
+    def _check(self) -> FuzzConfig:
+        # Requirements are only enforced when the extension is switched on.
+        # These defaults sit in every configuration, so validating them
+        # unconditionally would make a grammar mandatory for users who never
+        # asked for fuzzing at all.
+        if not self.enabled:
+            return self
+        if self.strategy == "grammar" and self.grammar is None:
+            raise ValueError(
+                "extensions.fuzz.strategy='grammar' requires extensions.fuzz.grammar"
+            )
+        if not self.versions:
+            raise ValueError("extensions.fuzz.versions must not be empty")
+        return self
+
+
 class ExtensionsConfig(Base):
     #: Names of optional extensions to activate. Unknown names are reported as
     #: configuration errors rather than ignored.
     enabled: list[str] = Field(default_factory=list)
     llm: LlmConfig = Field(default_factory=LlmConfig)
+    fuzz: FuzzConfig = Field(default_factory=FuzzConfig)
 
     @model_validator(mode="after")
     def _check(self) -> ExtensionsConfig:
-        if self.llm.enabled and "llm" not in self.enabled:
-            raise ValueError(
-                "extensions.llm.enabled is true but 'llm' is not in extensions.enabled"
-            )
+        for name in ("llm", "fuzz"):
+            section = getattr(self, name)
+            if section.enabled and name not in self.enabled:
+                raise ValueError(
+                    f"extensions.{name}.enabled is true but '{name}' is not in "
+                    "extensions.enabled"
+                )
         return self
 
 
